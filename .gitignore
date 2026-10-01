@@ -4,3 +4,4 @@ __pycache__/
 # BMW-derived flash images never go in the repo
 images/*
 !images/README.md
+ms45emu.egg-info/

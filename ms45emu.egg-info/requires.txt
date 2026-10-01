@@ -1,5 +1,0 @@
-unicorn>=2.1
-capstone>=5
-
-[test]
-pytest

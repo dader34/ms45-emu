@@ -1,9 +1,0 @@
-Metadata-Version: 2.4
-Name: ms45emu
-Version: 0.1.0
-Summary: Routine-level emulation of the Siemens MS45.1 DME (MPC555) for testing firmware patches
-Requires-Python: >=3.11
-Requires-Dist: unicorn>=2.1
-Requires-Dist: capstone>=5
-Provides-Extra: test
-Requires-Dist: pytest; extra == "test"
