@@ -8,16 +8,17 @@ delivered at those sites and at slice boundaries.
 """
 from collections import Counter
 
-from unicorn import (UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE_UNMAPPED, UC_HOOK_MEM_FETCH_UNMAPPED,
+from unicorn import (UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE_UNMAPPED, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_MEM_WRITE_PROT, UC_PROT_EXEC,
                      UC_HOOK_MEM_WRITE, UC_HOOK_INTR, UC_PROT_READ, UC_PROT_WRITE, UcError)
 from unicorn.ppc_const import UC_PPC_REG_MSR, UC_PPC_REG_PC
 
-from .machine import Machine
+from .machine import Machine, MPC_BASE, MPC_MAP, EXT_BASE, EXT_SIZE
 from .periph import MmioPage, write_zero_to_clear
 from .qspi import Qspi
 from .qadc import Qadc, QADC_A, QADC_B, SCAN_INSTRUCTIONS
 from .toucan import TouCan
-from .cpu import Cpu, VEC_EXTERNAL, VEC_DECREMENTER, VEC_SYSCALL, MSR_FP, SPR_EIE
+from .sci import Sci
+from .cpu import Cpu, VEC_EXTERNAL, VEC_DECREMENTER, VEC_SYSCALL, MSR_FP, SPR_EIE, SIU_SHADOW
 
 RESET_ENTRY = 0xFFF717B4         # the boot code after the reset vector's setup
 BOOT_IDLE = 0xFFF717FC           # `b .` at the end of the boot sequence
@@ -58,6 +59,8 @@ RAM_START, RAM_END = 0x3F8000, 0x400000
 # 16. 1 instruction = 1 clock here.
 CLOCKS_PER_TICK = 16
 SLICE = 20_000
+HURRY_SLICE = 256                # while an interrupt waits for the program to allow it
+BUSY_SLICE, BUSY_SLICES = 2000, 10   # after interrupt activity, this many short slices
 TICK_INSTRUCTIONS = 400_000      # the OS tick (MIOS PWM2 period), about 10 ms
 
 
@@ -113,7 +116,7 @@ class Board:
         # moves on, so it is only counted here.
         for ref, flag in ((TBREF0, TB_REFA), (TBREF1, TB_REFB)):
             self.siu.on_write(ref, lambda a, size, value, flag=flag: self._tbref_write(size, value, flag))
-        self.siu.on_read(SIPEND, lambda a, s: self.pending_external())
+        self.siu.on_read(SIPEND, lambda a, s: self.pending_external())   # for sites not relocated
 
         # TPU: host service requests are acknowledged at once; CISR is write-0-to-clear
         self.tpu_requests = 0
@@ -133,6 +136,14 @@ class Board:
         self.canp = MmioPage(m, CAN_PAGE, 0x1000)
         self.can_a = TouCan(self.canp, CAN_PAGE + 0x80, "A", lambda: self.instructions)
         self.can_b = TouCan(self.canp, CAN_PAGE + 0x480, "B", lambda: self.instructions)
+        # K-line
+        self.sci = Sci(self.imb, lambda: self.instructions)
+        # The flash is read-only to the program; writes are commands to the
+        # chips (or stray) and go to the flash models through the hook.
+        m.mu.mem_protect(MPC_BASE, MPC_MAP, UC_PROT_READ | UC_PROT_EXEC)
+        m.mu.mem_protect(EXT_BASE, EXT_SIZE, UC_PROT_READ | UC_PROT_EXEC)
+        self.flash_writes = []
+        m.mu.hook_add(UC_HOOK_MEM_WRITE_PROT, self._flash_write)
 
         # MIOS interrupts: status registers write-0-to-clear, request = status & enable,
         # bank-1 bit 6 always asserted (the OS's software interrupt).
@@ -148,6 +159,8 @@ class Board:
         self.interrupts_taken = Counter()
         self.dec_exceptions = 0
         self.dec_pending = False
+        self._hurry = False
+        self._busy = 0
         self.fp_enables = 0
         self.instructions = 0
         self.ticks = 0
@@ -199,6 +212,11 @@ class Board:
                 inner(m)
         self.probes[(addr + 4) & 0xFFFFFFFF] = (name or f"0x{addr:X}", fn)
         self.probe_counts[name or f"0x{addr:X}"] = 0
+
+    def _flash_write(self, mu, access, addr, size, value, ud):
+        if len(self.flash_writes) < 10000:
+            self.flash_writes.append((addr, size, value, self.m.pc))
+        return True                                   # continue; the write itself is dropped
 
     # ---- register handlers -----------------------------------------------
     def _tbref_write(self, size, value, flag):
@@ -255,8 +273,8 @@ class Board:
             pend |= 0x80000000 >> LEVEL_TPU
         if self.adc_a.interrupt_pending() or self.adc_b.interrupt_pending():
             pend |= 0x80000000 >> LEVEL_QADC
-        for can in (self.can_a, self.can_b):
-            level = can.interrupt_level()
+        for dev in (self.can_a, self.can_b, self.sci):
+            level = dev.interrupt_level()
             if level is not None:
                 pend |= 0x80000000 >> (2 * level + 1)
         tbscr = self.siu.peek16(TBSCR)
@@ -294,9 +312,10 @@ class Board:
             self.cpu.raise_exception(VEC_DECREMENTER)
             self.dec_exceptions += 1
             return True
-        pend = self.pending_external() & self.siu.peek32(SIMASK)
+        pend = self.pending_external() & self.m.read32(SIU_SHADOW + 4)
         if pend:
             level = 32 - pend.bit_length()
+            self.m.write32(SIU_SHADOW, self.pending_external())      # SIPEND, as the prologue reads it
             self.cpu.raise_exception(VEC_EXTERNAL)
             self.interrupts_taken[level] += 1
             return True
@@ -346,7 +365,14 @@ class Board:
         so its exception lands close to the right moment: the kernel reads
         DEC afterwards as the (small, negative) overshoot."""
         dec = self.cpu.read_dec()
-        n = SLICE
+        # Interrupts are only delivered at slice boundaries. While one is
+        # pending that could not be taken (EE off, a critical section), keep
+        # the slices short so it is taken soon after the program allows it,
+        # as it would be on hardware.
+        # Right after interrupt activity the drivers chain more requests
+        # (QSPI transfer -> event -> next transfer), so stay fine-grained for
+        # a while; otherwise take long slices.
+        n = HURRY_SLICE if self._hurry else (BUSY_SLICE if self._busy else SLICE)
         if dec < 0x80000000 and dec * CLOCKS_PER_TICK < n:
             n = dec * CLOCKS_PER_TICK + CLOCKS_PER_TICK
         # Likewise the time base reference compares, so their status bit is
@@ -365,6 +391,7 @@ class Board:
         self.instructions += ran
         if self._advance_clocks(ran):
             self.dec_pending = True
+        self.sci.service()
         # A software-started ADC scan takes real time, so it completes here.
         self.adc_a.service()
         self.adc_b.service()
@@ -390,7 +417,12 @@ class Board:
             self.ticks += 1
             if self.mios.peek16(MIOS_ER0) & PWM2_BIT:
                 self.mios.poke16(MIOS_SR0, self.mios.peek16(MIOS_SR0) | PWM2_BIT)
-        self._deliver()
+        delivered = self._deliver()
+        pend = self.pending_external()
+        if not delivered:
+            self.m.write32(SIU_SHADOW, pend)
+        self._hurry = self.dec_pending or bool(pend & self.m.read32(SIU_SHADOW + 4))
+        self._busy = BUSY_SLICES if (delivered or self._hurry) else max(0, self._busy - 1)
 
     # ---- running ------------------------------------------------------------
     # ---- the car around the DME ----------------------------------------------
