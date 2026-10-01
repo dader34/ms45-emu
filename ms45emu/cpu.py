@@ -19,7 +19,7 @@ MSR_EE = 0x8000
 
 # Vector table in the MPC's first 0x100 bytes: entry n at 8*n is `ba handler`.
 VECTOR_STRIDE = 8
-VEC_MACHINE_CHECK, VEC_EXTERNAL, VEC_DECREMENTER = 2, 5, 9
+VEC_MACHINE_CHECK, VEC_EXTERNAL, VEC_DECREMENTER, VEC_SYSCALL = 2, 5, 9, 12
 
 
 def _asm(words):
@@ -40,16 +40,37 @@ def find_rfi(image, base):
     return out
 
 
-def find_msr_sprs(image, base):
-    """Addresses of every `mtspr EIE/EID/NRI` in an image (op 31, xo 467)."""
+SPR_TBL_R, SPR_TBU_R, SPR_TBL_W, SPR_TBU_W = 268, 269, 284, 285
+
+
+def find_trap_sites(image, base):
+    """Instructions Unicorn cannot run faithfully, to be replaced by `sc`:
+    `mtspr EIE/EID/NRI` (no-ops under Unicorn), and time base access
+    (`mftb`, `mfspr/mtspr TBL/TBU`: the time base reads zero and cannot be
+    written). Returns addr -> ("msr", spr) | ("tb_read", reg, spr) | ("tb_write", reg, spr)."""
     out = {}
     for off in range(0, len(image) - 3, 4):
         w = struct.unpack(">I", image[off:off + 4])[0]
-        if w >> 26 == 31 and ((w >> 1) & 0x3FF) == 467:
-            spr = ((w >> 16) & 31) | (((w >> 11) & 31) << 5)
-            if spr in (SPR_EIE, SPR_EID, SPR_NRI):
-                out[(base + off) & 0xFFFFFFFF] = spr
+        if w >> 26 != 31:
+            continue
+        xo = (w >> 1) & 0x3FF
+        reg = (w >> 21) & 31
+        spr = ((w >> 16) & 31) | (((w >> 11) & 31) << 5)
+        addr = (base + off) & 0xFFFFFFFF
+        if xo == 467 and spr in (SPR_EIE, SPR_EID, SPR_NRI):
+            out[addr] = ("msr", spr)
+        elif xo == 371 or (xo == 339 and spr in (SPR_TBL_R, SPR_TBU_R)):
+            out[addr] = ("tb_read", reg, spr)
+        elif xo == 467 and spr in (SPR_TBL_W, SPR_TBU_W):
+            out[addr] = ("tb_write", reg, spr)
     return out
+
+
+def find_msr_sprs(image, base):
+    return {a: v[1] for a, v in find_trap_sites(image, base).items() if v[0] == "msr"}
+
+
+SC = 0x44000002
 
 
 class Cpu:
@@ -58,12 +79,56 @@ class Cpu:
         self.tb = 0
         self.dec_base = 0
         self._build_stubs()
-        # MPC5xx EIE/EID/NRI are no-ops under Unicorn; they are applied to
-        # MSR here, from a code hook, so interrupt masking is real.
-        self.msr_sprs = find_msr_sprs(m.pair.mpc, 0)
-        self.msr_sprs.update(find_msr_sprs(m.pair.flash, 0xFFF00000))
-        self.msr_sprs.update(find_msr_sprs(m.pair.flash, 0xFFE00000))
+        # MPC5xx EIE/EID/NRI are no-ops under Unicorn. Every such site is
+        # replaced in the loaded image by `sc`, whose exception hook applies
+        # the MSR change; this costs nothing on other instructions, unlike
+        # code hooks. The program's checksums are then recomputed over the
+        # patched image, see checksums.py.
+        self.trap_sites = find_trap_sites(m.pair.mpc, 0)
+        self.trap_sites.update(find_trap_sites(m.pair.flash, 0xFFF00000))
+        self.msr_sprs = {a: v[1] for a, v in self.trap_sites.items() if v[0] == "msr"}
         self.rfi_sites = find_rfi(m.pair.mpc, 0) | find_rfi(m.pair.flash, 0xFFF00000)
+        self.sc_sites = {}                    # pc after the sc -> site description
+        self._patch_trap_sites()
+
+    def _patch_trap_sites(self):
+        m = self.m
+        for pc, site in self.trap_sites.items():
+            m.write32(pc, SC)
+            self.sc_sites[(pc + 4) & 0xFFFFFFFF] = site
+            if pc >= 0xFFF00000:
+                m.write32(pc - 0x100000, SC)          # the 0xFFExxxxx mirror
+                self.sc_sites[(pc - 0x100000 + 4) & 0xFFFFFFFF] = site
+        from .checksums import refresh_program_sums
+        refresh_program_sums(m)
+
+    def handle_trap(self, site):
+        """Emulate a trapped instruction. Returns the spr for an MSR site."""
+        kind = site[0]
+        if kind == "msr":
+            self.apply_msr_spr_value(site[1])
+            return site[1]
+        _, reg, spr = site
+        if kind == "tb_read":
+            self.m.set_reg(reg, (self.tb >> 32) if spr == SPR_TBU_R else (self.tb & 0xFFFFFFFF))
+        else:
+            v = self.m.reg(reg)
+            if spr == SPR_TBU_W:
+                self.tb = (v << 32) | (self.tb & 0xFFFFFFFF)
+            else:
+                self.tb = (self.tb & 0xFFFFFFFF00000000) | v
+        return None
+
+    def apply_msr_spr_value(self, spr):
+        mu = self.m.mu
+        msr = mu.reg_read(UC_PPC_REG_MSR)
+        if spr == SPR_EIE:
+            msr |= MSR_EE | MSR_RI
+        elif spr == SPR_EID:
+            msr &= ~MSR_EE
+        else:
+            msr &= ~(MSR_EE | MSR_RI)
+        mu.reg_write(UC_PPC_REG_MSR, msr)
 
     def apply_msr_spr(self, pc):
         """Call from a code hook; returns True when pc was one of them."""
@@ -132,7 +197,7 @@ class Cpu:
         self._run_stub(self.write_dec_stub, 1, r3=value & 0xFFFFFFFF)
 
     def write_tb(self, value):
-        self._run_stub(self.write_tb_stub, 2, r3=value & 0xFFFFFFFF, r4=(value >> 32) & 0xFFFFFFFF)
+        self.tb = value                        # served to the program by the trapped mftb sites
 
     @property
     def msr(self):

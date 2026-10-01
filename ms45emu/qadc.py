@@ -1,17 +1,17 @@
 """The two QADC modules (QADC_A at 0x304800, QADC_B at 0x304C00), as far as
 the DME uses them at ignition-on.
 
-Configuration the boot programs: queue 2 is a periodic continuous scan
-(QACR2 MQ2 = 0x18) with its completion interrupt enabled, queue 1 is a
-software/externally started single scan. The scan walks the CCW RAM from
-BQ2 to the end-of-queue word (0x3F) and writes one result per CCW into the
-result RAM. Completion sets CF2 in QASR0 and the module's interrupt level
-(QADCINT IRLQ2 = 3) reaches the SIU as LVL3.
+Queue 2 is a periodic continuous scan (QACR2 MQ2 = 0x18) with its
+completion interrupt enabled; queue 1 is a software-started single scan,
+re-armed by its handler. A scan walks the CCW RAM from the queue start to
+the end-of-queue word (0x3F) and writes one result per CCW into the result
+RAM. Completion sets CF1/CF2 in QASR0 and the module's interrupt level
+(QADCINT IRLQ = 3) reaches the SIU as LVL3.
 
-Channel values are "resting": a sensible mid value unless a test sets a
-channel. Results are 10 bits.
+Channel values are "resting": mid-scale unless a test sets a channel.
+Results are 10 bits.
 """
-from unicorn import UC_HOOK_MEM_WRITE
+from .periph import write_zero_to_clear
 
 QADC_A, QADC_B = 0x304800, 0x304C00
 QADCINT, QACR0, QACR1, QACR2, QASR0, QASR1 = 0x04, 0x0A, 0x0C, 0x0E, 0x10, 0x12
@@ -25,68 +25,69 @@ SCAN_INSTRUCTIONS = 400_000
 
 
 class Qadc:
-    def __init__(self, machine, base, name):
-        self.m = machine
+    def __init__(self, page, base, name):
+        self.p = page
         self.base = base
         self.name = name
         self.channels = {}            # channel -> 10-bit value
         self.default = 0x200
         self.scans = 0
         self.single_scans = 0
-        machine.mu.hook_add(UC_HOOK_MEM_WRITE, self._qacr1_write, begin=base + QACR1, end=base + QACR1 + 1)
-        machine.mu.hook_add(UC_HOOK_MEM_WRITE, self._qacr2_write, begin=base + QACR2, end=base + QACR2 + 1)
-        self._start_q1 = False
-        self.queue2_started = False      # set when queue 2 is switched on; the first scan follows at once
+        self.q1_due = False           # a software scan was started; completes at the slice boundary
+        self.queue2_started = False   # queue 2 switched on; the first scan follows at once
+        page.on_write(base + QACR1, self._qacr1_write)
+        page.on_write(base + QACR2, self._qacr2_write)
+        write_zero_to_clear(page, base + QASR0)
 
-    def _qacr2_write(self, mu, access, addr, size, value, ud):
+    def _qacr1_write(self, addr, size, value):
+        if size == 2 and value & SSE1 and (value & 0x1F00):
+            self.q1_due = True
+        return None
+
+    def _qacr2_write(self, addr, size, value):
         if size == 2 and (value >> 8) & 0x1F:
             self.queue2_started = True
-
-    def _qacr1_write(self, mu, access, addr, size, value, ud):
-        if size == 2 and value & SSE1 and (value & 0x1F00):
-            self._start_q1 = True
+        return None
 
     def value(self, channel):
         return self.channels.get(channel, self.default) & 0x3FF
 
     def _scan(self, start):
-        m = self.m
+        p = self.p
         q = start
         while q < 64:
-            ccw = m.read16(self.base + CCW_RAM + 2 * q)
+            ccw = p.peek16(self.base + CCW_RAM + 2 * q)
             chan = ccw & 0x3F
             if chan == END_OF_QUEUE:
                 break
             v = self.value(chan)
-            m.write16(self.base + RESULT_RJ + 2 * q, v)
-            m.write16(self.base + RESULT_LJU + 2 * q, v << 6)
-            m.write16(self.base + RESULT_LJS + 2 * q, ((v - 0x200) << 6) & 0xFFFF)
+            p.poke16(self.base + RESULT_RJ + 2 * q, v)
+            p.poke16(self.base + RESULT_LJU + 2 * q, v << 6)
+            p.poke16(self.base + RESULT_LJS + 2 * q, ((v - 0x200) << 6) & 0xFFFF)
             q += 1
 
     def service(self):
-        """Run a software-started queue 1 scan, if one was requested."""
-        if self._start_q1:
-            self._start_q1 = False
-            m = self.m
-            qacr1 = m.read16(self.base + QACR1)
-            m.write16(self.base + QACR1, qacr1 & ~SSE1)
+        """Complete a software-started queue 1 scan, if one is due."""
+        if self.q1_due:
+            self.q1_due = False
+            p = self.p
+            p.poke16(self.base + QACR1, p.peek16(self.base + QACR1) & ~SSE1)
             self._scan(0)
-            m.write16(self.base + QASR0, m.read16(self.base + QASR0) | CF1)
+            p.poke16(self.base + QASR0, p.peek16(self.base + QASR0) | CF1)
             self.single_scans += 1
 
     def periodic(self):
         """One period of queue 2."""
-        m = self.m
-        qacr2 = m.read16(self.base + QACR2)
-        mq2 = (qacr2 >> 8) & 0x1F
-        if mq2 == 0:
+        p = self.p
+        qacr2 = p.peek16(self.base + QACR2)
+        if (qacr2 >> 8) & 0x1F == 0:
             return
         self._scan(qacr2 & 0x3F)
-        m.write16(self.base + QASR0, m.read16(self.base + QASR0) | CF2)
+        p.poke16(self.base + QASR0, p.peek16(self.base + QASR0) | CF2)
         self.scans += 1
 
     def interrupt_pending(self):
-        m = self.m
-        qasr = m.read16(self.base + QASR0)
-        return bool((qasr & CF1 and m.read16(self.base + QACR1) & CIE1) or
-                    (qasr & CF2 and m.read16(self.base + QACR2) & CIE2))
+        p = self.p
+        qasr = p.peek16(self.base + QASR0)
+        return bool((qasr & CF1 and p.peek16(self.base + QACR1) & CIE1) or
+                    (qasr & CF2 and p.peek16(self.base + QACR2) & CIE2))

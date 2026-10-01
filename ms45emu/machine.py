@@ -42,7 +42,9 @@ MAX_INSNS = 50_000_000
 
 
 class Machine:
-    def __init__(self, pair):
+    def __init__(self, pair, periph_ram=True):
+        """periph_ram: map the peripheral space as plain RAM (reads zero).
+        The board turns this off and maps the pages as MMIO instead."""
         self.pair = pair
         mu = Uc(UC_ARCH_PPC, UC_MODE_32 | UC_MODE_BIG_ENDIAN)
         self.mu = mu
@@ -54,7 +56,8 @@ class Machine:
         mu.mem_write(EXT_BASE, pair.flash)
         mu.mem_write(EXT_BASE + FLASH_SIZE, pair.flash)      # the mirror
 
-        mu.mem_map(PERIPH_BASE, PERIPH_SIZE)
+        if periph_ram:
+            mu.mem_map(PERIPH_BASE, PERIPH_SIZE)
         mu.mem_map(RAM_BASE, RAM_SIZE)
         mu.mem_map(RETURN_SENTINEL, SENTINEL_SIZE)
 

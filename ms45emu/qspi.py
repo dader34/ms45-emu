@@ -13,8 +13,6 @@ PCS3 are other devices, answered as an open bus until modelled.
 """
 import struct
 
-from unicorn import UC_HOOK_MEM_WRITE
-
 QSMCM = 0x305000
 SPCR0 = QSMCM + 0x18
 SPCR1 = QSMCM + 0x1A
@@ -29,8 +27,6 @@ QUEUE = 32
 SPE = 0x8000
 SPIFIE = 0x8000
 SPIF = 0x80
-
-QSPI_INTERRUPT = 0x0D        # the DME's wrapper id for the QSPI handler
 
 
 class Eeprom25:
@@ -52,8 +48,7 @@ class Eeprom25:
         resp = bytearray(len(out))
         if op == 0x03 and len(out) >= 3:                       # READ addr16, then data
             addr = (out[1] << 8) | out[2]
-            n = len(out) - 3
-            for i in range(n):
+            for i in range(len(out) - 3):
                 resp[3 + i] = self.data[(addr + i) % len(self.data)]
             self.reads += 1
         elif op == 0x02 and len(out) >= 3:                     # WRITE addr16, data
@@ -80,60 +75,55 @@ class OpenDevice:
 
 
 class Qspi:
-    def __init__(self, machine, raise_interrupt):
-        self.m = machine
-        self.raise_interrupt = raise_interrupt
+    def __init__(self, page):
+        self.page = page
         self.devices = {pcs: OpenDevice() for pcs in range(16)}
         self.eeprom = Eeprom25()
         self.devices[0xD] = self.eeprom           # PCS1 low
-        self.pending = False
         self.transfers = 0
         self.log = []
-        machine.mu.hook_add(UC_HOOK_MEM_WRITE, self._spcr1_write, begin=SPCR1, end=SPCR1 + 1)
+        page.on_write(SPCR1, self._spcr1_write)
 
-    def _spcr1_write(self, mu, access, addr, size, value, ud):
-        # The store has not landed yet; the transfer runs at the next instruction.
+    def _spcr1_write(self, addr, size, value):
         if size == 2 and value & SPE:
-            self.pending = True
+            self._transfer()
+            return value & ~SPE                   # the queue has run by the time SPE is read back
+        return None
 
-    def service(self):
-        """Called between instructions: run a transfer that was started."""
-        if not self.pending:
-            return
-        self.pending = False
-        m = self.m
-        spcr2 = m.read16(SPCR2)
-        newqp, endqp = spcr2 & 0xF, (spcr2 >> 8) & 0xF
+    def _transfer(self):
+        p = self.page
+        spcr2 = p.peek16(SPCR2)
+        newqp, endqp = spcr2 & 0x1F, (spcr2 >> 8) & 0x1F
         q = newqp
         entries = []
         while True:
             entries.append(q)
-            if q == endqp:
+            if q == endqp or len(entries) >= QUEUE:
                 break
             q = (q + 1) % QUEUE
 
-        # Group into transactions by chip select and CONT.
         i = 0
         while i < len(entries):
-            cmd = m.read8(CMD_RAM + entries[i])
+            cmd = p.peek8(CMD_RAM + entries[i])
             pcs = cmd & 0xF
             group = [entries[i]]
-            while m.read8(CMD_RAM + entries[i]) & 0x80 and i + 1 < len(entries) \
-                    and (m.read8(CMD_RAM + entries[i + 1]) & 0xF) == pcs:
+            while p.peek8(CMD_RAM + entries[i]) & 0x80 and i + 1 < len(entries) \
+                    and (p.peek8(CMD_RAM + entries[i + 1]) & 0xF) == pcs:
                 i += 1
                 group.append(entries[i])
             i += 1
-            out = b"".join(struct.pack(">H", m.read16(TX_RAM + 2 * e)) for e in group)
+            out = b"".join(struct.pack(">H", p.peek16(TX_RAM + 2 * e)) for e in group)
             resp = self.devices[pcs].transaction(out)
             resp = resp.ljust(len(out), b"\xff")[:len(out)]
             for k, e in enumerate(group):
-                m.write(RX_RAM + 2 * e, resp[2 * k:2 * k + 2])
+                p.poke16(RX_RAM + 2 * e, int.from_bytes(resp[2 * k:2 * k + 2], "big"))
             self.log.append((pcs, out.hex(), resp.hex()))
             if len(self.log) > 200:
                 self.log.pop(0)
 
         self.transfers += 1
-        m.write16(SPCR1, m.read16(SPCR1) & ~SPE)
-        m.write8(SPSR, SPIF | (endqp & 0x1F))
-        if spcr2 & SPIFIE:
-            self.raise_interrupt(QSPI_INTERRUPT)
+        p.poke8(SPSR, SPIF | (endqp & 0x1F))
+
+    def interrupt_pending(self):
+        p = self.page
+        return bool(p.peek8(SPSR) & SPIF and p.peek16(SPCR2) & SPIFIE)
