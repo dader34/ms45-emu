@@ -124,6 +124,9 @@ class Board:
         self.siu.on_read(SIPEND, lambda a, s: self.pending_external())   # for sites not relocated
 
         # TPU: host service requests are acknowledged at once; CISR is write-0-to-clear
+        from .tpu import Tpu
+        self.tpu_a = Tpu(self.imb, 0x304000, "A")
+        self.tpu_b = Tpu(self.imb, 0x304400, "B")
         self.tpu_requests = 0
         for reg in TPU_HSRR:
             self.imb.on_write(reg, self._hsrr_write)
@@ -261,6 +264,7 @@ class Board:
                     ch = first + i
                     w7 = tpu + 0x100 + ch * 16 + 0xE
                     self.imb.poke16(w7, self.imb.peek16(w7) | 0x2000)
+                    (self.tpu_a if tpu == 0x304000 else self.tpu_b).on_service(ch, self.instructions)
         return 0                                  # serviced before it can be read back
 
     def _er1_write(self, addr, size, value):

@@ -58,7 +58,8 @@ The patched pair is what the BMWeb Flasher's Map Switch view saves.
 - `ms45emu/dme.py`      traced addresses and helpers for this program
 - `ms45emu/board.py`    the board around the CPU: peripherals, interrupts, the boot loop
 - `ms45emu/cpu.py`      SRR0/SRR1, TB/DEC and EIE/EID, which Unicorn does not expose
-- `ms45emu/qspi.py`, `ms45emu/qadc.py`, `ms45emu/toucan.py`  the QSPI/EEPROM, ADC and CAN models
+- `ms45emu/qspi.py`, `ms45emu/qadc.py`, `ms45emu/toucan.py`, `ms45emu/tpu.py`, `ms45emu/flashchip.py`  the QSPI/EEPROM, ADC, CAN, TPU and flash-chip models
+- `ms45emu/sci.py`, `ms45emu/kwp.py`  the K line and a KWP tester
 - `ms45emu/e46.py`      the other modules on the E46's bus
 - `tools/bench.py`      the DME on a real CAN adapter
 - `tests/`              the checks, one file per subject (`test_boot.py` is the full boot; the ignition-off round trip needs `MS45_SLOW=1`)

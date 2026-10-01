@@ -63,7 +63,7 @@ image (`checksums.py`).
 |---|---|---|
 | Absent hardware (dev-RAM probe at `0xFFC40000`) | `OpenBus`: reads 0xFF, writes vanish, not executable | Makes the probe fail the production way |
 | Watchdog | counts the 0x556C/0xAA39 service pairs | Does not reset the machine |
-| TPU | host service requests acknowledged at once; parameter word 7 bit 0x2000 set for the channel | TPU A at `0x304000`, B at `0x304400`; the DME loads its own microcode into DPTRAM (`0x302000`), so engine functions are out of reach |
+| TPU | host service requests acknowledged; `ms45emu/tpu.py` classifies each channel by its CFSR function and captures output servicing | TPU A at `0x304000`, B at `0x304400`; microcode is custom so function numbers are mapped by role, not the Motorola ROM set |
 | Serial EEPROM | `Qspi` + `Eeprom25` on PCS1 | 32-entry queue; entries are 16-bit when BITSE is set (SPCR0[BITS]=0) and 8-bit otherwise, which is how WREN/WRDI go out; READ/WRITE are `op addr16` + 3 data bytes |
 | OS event interrupt | MIOS1 bank 1 bit 6 (MMCSM22), enabled by the event poster | The drain is `0x1CC7C` |
 | MIOS PWM2 interrupt (bank 0 bit 2) | periodic, `TICK_INSTRUCTIONS` | Its handler toggles an output pin; it is not the OS tick |
