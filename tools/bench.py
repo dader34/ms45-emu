@@ -3,8 +3,14 @@
 
     .venv/bin/pip install python-can
     .venv/bin/python tools/bench.py --interface slcan --channel /dev/tty.usbmodemXXXX --bitrate 500000
+    .venv/bin/python tools/bench.py --interface gs_usb                   # candleLight firmware (CANable clones)
     .venv/bin/python tools/bench.py --interface socketcan --channel can0
     .venv/bin/python tools/bench.py --virtual              # no adapter: print what the DME sends
+
+A CANable with slcan firmware is a serial port and needs nothing else.
+With candleLight (gs_usb) firmware on macOS: `brew install libusb` and
+`pip install pyusb`, then --interface gs_usb (channel defaults to the
+first device; pass --channel 0/1 for a second one).
 
 Frames the DME transmits on module A go out on the adapter as they are
 built; frames seen on the adapter are fed to the DME's receive buffers.
@@ -40,7 +46,14 @@ def main():
     bus = None
     if not args.virtual:
         import can
-        bus = can.Bus(interface=args.interface, channel=args.channel, bitrate=args.bitrate)
+        if args.interface is None:
+            ap.error("--interface is required unless --virtual")
+        kwargs = {"bitrate": args.bitrate}
+        if args.interface == "gs_usb":
+            kwargs.update(channel=int(args.channel or 0), index=int(args.channel or 0))
+        else:
+            kwargs["channel"] = args.channel
+        bus = can.Bus(interface=args.interface, **kwargs)
 
     board = Board(load_pair(args.pair))
     if os.path.exists(args.eeprom):
