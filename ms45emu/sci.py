@@ -3,7 +3,7 @@
 The firmware runs it at 9600 baud (SCBR = 130) with 9-bit frames and
 does the even parity itself, so the ninth bit carries the parity of the
 byte. Bytes from the tester go in with `send()`; they are presented one
-per byte time (`BYTE_INSTRUCTIONS`) so the DME's receive interrupt sees
+per byte time at the programmed rate so the DME's receive interrupt sees
 them the way a real line delivers them. Bytes the DME transmits are
 collected in `tx` (and handed to `on_tx` if set) and echoed back into
 the receiver, as the single wire does.
@@ -21,7 +21,12 @@ TIE, TCIE, RIE, ILIE, TE, RE = 0x80, 0x40, 0x20, 0x10, 0x08, 0x04
 # SC1SR
 TDRE, TC, RDRF, RAF, IDLE, OR = 0x100, 0x80, 0x40, 0x20, 0x10, 0x08
 
-BYTE_INSTRUCTIONS = 40_000_000 * 11 // 9600      # one 9600-baud frame of 11 bits at 40 MHz
+CLOCK = 40_000_000
+
+
+def byte_instructions(scbr):
+    """One 11-bit frame at the programmed rate: baud = clock / (32 * SCBR)."""
+    return 11 * 32 * max(scbr & 0x1FFF, 1)
 
 
 class Sci:
@@ -83,7 +88,7 @@ class Sci:
         parity = bin(b).count("1") & 1
         self._rdr = b | (parity << 8)
         self.p.poke16(SC1SR, sr | RDRF)
-        self.rx_next_at = self.now() + BYTE_INSTRUCTIONS
+        self.rx_next_at = self.now() + byte_instructions(self.p.peek16(SCC1R0))
 
     def interrupt_level(self):
         sr = self.p.peek16(SC1SR)

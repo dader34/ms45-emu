@@ -34,6 +34,7 @@ TBSCR, TBREF0, TBREF1 = 0x2FC200, 0x2FC204, 0x2FC208
 TB_REFA, TB_REFB, TB_REFAE, TB_REFBE = 0x80, 0x40, 0x08, 0x04
 SWSR_SEQUENCE = (0x556C, 0xAA39)
 SIPEND, SIMASK = 0x2FC010, 0x2FC014
+BR0, OR0 = 0x2FC100, 0x2FC104
 
 TPU_HSRR = [0x304018, 0x30401A, 0x304418, 0x30441A]    # TPU A (0x304000), B (0x304400): HSRR1, HSRR0
 TPU_CISR = [0x304020, 0x304420]
@@ -98,6 +99,10 @@ class Board:
         self.bus = OpenBus(m)
 
         self.siu = MmioPage(m, SIU_PAGE, 0x1000)
+        # Memory controller: CS0 is the external flash, 2 MB at 0xFFE00000
+        # from the reset configuration; the firmware only ORs bits into it.
+        self.siu.poke32(BR0, 0xFFE00001)
+        self.siu.poke32(OR0, 0xFFE00000)
         self.imb = MmioPage(m, TPU_QADC_QSMCM_PAGE, 0x2000)
         self.mios = MmioPage(m, MIOS_PAGE, 0x1000)
 
@@ -143,6 +148,8 @@ class Board:
         m.mu.mem_protect(MPC_BASE, MPC_MAP, UC_PROT_READ | UC_PROT_EXEC)
         m.mu.mem_protect(EXT_BASE, EXT_SIZE, UC_PROT_READ | UC_PROT_EXEC)
         self.flash_writes = []
+        from .flashchip import FlashChip
+        self.flash = FlashChip(m)
         m.mu.hook_add(UC_HOOK_MEM_WRITE_PROT, self._flash_write)
 
         # MIOS interrupts: status registers write-0-to-clear, request = status & enable,
@@ -216,7 +223,11 @@ class Board:
     def _flash_write(self, mu, access, addr, size, value, ud):
         if len(self.flash_writes) < 10000:
             self.flash_writes.append((addr, size, value, self.m.pc))
-        return True                                   # continue; the write itself is dropped
+        # External flash (and its programming-mode window): a command to the
+        # chip. The internal MPC flash has no command set and is left dropped.
+        if any(base <= addr < base + self.flash.size for base in self.flash.windows):
+            self.flash.write(addr, size, value)
+        return True                                   # the raw store is still dropped
 
     # ---- register handlers -----------------------------------------------
     def _tbref_write(self, size, value, flag):

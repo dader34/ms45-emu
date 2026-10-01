@@ -28,6 +28,8 @@ def _asm(words):
 
 
 MSR_RI = 0x2
+MSR_IP = 0x40                  # exception prefix: vectors at 0xFFF00000
+MSR_IR_DR = 0x30               # relocation: meaningless on the MPC555, fatal under Unicorn
 MSR_FP = 0x2000
 SPR_EIE, SPR_EID, SPR_NRI = 80, 81, 82
 
@@ -125,6 +127,7 @@ class Cpu:
                     m.write32(at, SC)
                     self.sc_sites[(at + 4) & 0xFFFFFFFF] = site
         self.siu_window_sites, self.sipend_store_sites = relocate_siu_window(m, self.sc_sites)
+        self.msr_const_sites = clear_relocation_bits(m)
         from .checksums import refresh_program_sums
         refresh_program_sums(m)
 
@@ -202,34 +205,41 @@ class Cpu:
         m = self.m
         # One raise stub per exception vector, 0x20 bytes apart from SCRATCH:
         # r3 = SRR0 value, r4 = SRR1 value on entry; both are restored from
-        # scratch+0x184.. and the stub ends with the vector's own `ba`
+        # scratch+0x300.. and the stub ends with the vector's own `ba`
         # instruction copied out of the compressed table, so neither CTR
         # nor LR is disturbed (the program's handler saves whatever it finds
         # in them, so a clobbered CTR would survive the rfi).
-        self.saved_regs = 0x00100184       # r3, r4 saved here
+        self.saved_regs = 0x00100300       # r3, r4 saved here (after the stubs)
+        # Two tables: MSR[IP] clear takes the compressed table at MPC 0
+        # (8 bytes per vector); IP set takes the real one in the external
+        # flash at 0xFFF00000 (0x100 per vector), which the programming
+        # mode switches to.
         self.raise_stubs = {}
-        for i, vector in enumerate((VEC_MACHINE_CHECK, VEC_EXTERNAL, VEC_DECREMENTER, VEC_SYSCALL)):
-            stub = SCRATCH + 0x20 * i
-            ba = m.read32(vector * VECTOR_STRIDE)
-            assert ba >> 26 == 18 and ba & 2, f"vector {vector}: not a ba"
-            m.write(stub, _asm([
-                0x7C7A03A6,             # mtspr SRR0, r3
-                0x7C9B03A6,             # mtspr SRR1, r4
-                0x3C600010,             # lis r3, 0x10
-                0x80830188,             # lwz r4, 0x188(r3)
-                0x80630184,             # lwz r3, 0x184(r3)
-                ba,                     # ba handler
-            ]))
-            self.raise_stubs[vector] = stub
+        i = 0
+        for ip in (0, 1):
+            for vector in (VEC_MACHINE_CHECK, VEC_EXTERNAL, VEC_DECREMENTER, VEC_SYSCALL):
+                stub = SCRATCH + 0x20 * i
+                i += 1
+                ba = m.read32(0xFFF00000 + vector * 0x100 if ip else vector * VECTOR_STRIDE)
+                assert ba >> 26 == 18 and ba & 2, f"vector {vector}: not a ba"
+                m.write(stub, _asm([
+                    0x7C7A03A6,             # mtspr SRR0, r3
+                    0x7C9B03A6,             # mtspr SRR1, r4
+                    0x3C600010,             # lis r3, 0x10
+                    0x80830304,             # lwz r4, 0x304(r3)
+                    0x80630300,             # lwz r3, 0x300(r3)
+                    ba,                     # ba handler
+                ]))
+                self.raise_stubs[(vector, ip)] = stub
 
         # read DEC into r3, then stop (the caller runs until the nop after).
-        self.read_dec_stub = SCRATCH + 0xA0
+        self.read_dec_stub = SCRATCH + 0x100
         m.write(self.read_dec_stub, _asm([0x7C7602A6, 0x60000000]))        # mfspr r3,DEC ; nop
         # write DEC from r3
-        self.write_dec_stub = SCRATCH + 0xB0
+        self.write_dec_stub = SCRATCH + 0x110
         m.write(self.write_dec_stub, _asm([0x7C7603A6, 0x60000000]))       # mtspr DEC,r3 ; nop
         # write TB from r3 (low) and r4 (high)
-        self.write_tb_stub = SCRATCH + 0xC0
+        self.write_tb_stub = SCRATCH + 0x120
         m.write(self.write_tb_stub, _asm([0x7C9D03A6, 0x7C7C03A6, 0x60000000]))  # mtspr TBU,r4 ; mtspr TBL,r3 ; nop
 
     # ---- helpers that run a stub without disturbing the program ----------
@@ -265,7 +275,7 @@ class Cpu:
         return bool(self.msr & MSR_EE)
 
     def in_stub(self, pc):
-        return SCRATCH <= pc < SCRATCH + 0x100 or MSR_STUB_BASE <= pc < MSR_STUB_BASE + MSR_STUB_SIZE
+        return SCRATCH <= pc < SCRATCH + 0x140 or MSR_STUB_BASE <= pc < MSR_STUB_BASE + MSR_STUB_SIZE
 
     def raise_exception(self, vector):
         """Enter the program's exception vector as the hardware would: SRR0 =
@@ -280,7 +290,7 @@ class Cpu:
         m.set_reg(3, pc)
         m.set_reg(4, msr)
         mu.reg_write(UC_PPC_REG_MSR, msr & ~MSR_EE)
-        stub = self.raise_stubs[vector]
+        stub = self.raise_stubs[(vector, 1 if msr & MSR_IP else 0)]
         mu.reg_write(UC_PPC_REG_PC, stub)
         return stub
 
@@ -367,3 +377,20 @@ def relocate_siu_window(m, sc_sites):
             m.write32(a, SC)
             sc_sites[(a + 4) & 0xFFFFFFFF] = ("nop",)
     return a1 + a2, s1 + s2
+
+
+def clear_relocation_bits(m):
+    """`li rX, imm; mtmsr rX` with IR/DR in imm: the MPC555 has no MMU and
+    ignores them, Unicorn's core would start translating. Clear them in
+    the constant."""
+    sites = []
+    for base, buf in ((0, m.pair.mpc), (0xFFF00000, m.pair.flash)):
+        for a in range(0, len(buf) - 4, 4):
+            w = struct.unpack(">I", buf[a:a + 4])[0]
+            w2 = struct.unpack(">I", buf[a + 4:a + 8])[0]
+            if (w >> 26 == 14 and (w >> 16) & 31 == 0 and w & MSR_IR_DR
+                    and w2 >> 26 == 31 and (w2 >> 1) & 0x3FF == 146 and (w >> 21) & 31 == (w2 >> 21) & 31):
+                for at in ([base + a, base + a - 0x100000] if base else [a]):
+                    m.write32(at, w & ~MSR_IR_DR)
+                sites.append(base + a)
+    return sites
