@@ -13,10 +13,17 @@ What it can do today:
 - drive the map-switch gesture / tach stub tick by tick, and the stored-data
   init / restore / save routines, exactly as the DME would call them.
 
-What it does not do: boot the whole DME. That needs models of the serial
-EEPROM, the monitoring processor's SPI handshake, the watchdog, timers and
-sensors. The memory map in `ms45emu/machine.py` is laid out so that can be
-added later.
+It also boots the whole program under `Board` (`ms45emu/board.py`), with
+models of the hardware around the CPU: open bus, watchdog, TPU
+acknowledgement, QSPI with a blank serial EEPROM, the MIOS interrupts the
+OS runs on, the ADC, and real exception delivery. The boot currently gets
+through the EEPROM load and into the init chain; `docs/full-boot.md` has
+the state of each piece and what is still missing.
+
+    from ms45emu import load_pair
+    from ms45emu.board import Board
+    b = Board(load_pair("stock"))
+    print(b.boot(max_insns=100_000_000), b.report())
 
 ## Setup
 
@@ -33,6 +40,9 @@ The patched pair is what the BMWeb Flasher's Map Switch view saves.
 - `ms45emu/machine.py`  the machine: memory map, registers, `call()` a routine
 - `ms45emu/image.py`    finding and validating a pair
 - `ms45emu/dme.py`      traced addresses and helpers for this program
+- `ms45emu/board.py`    the board around the CPU: peripherals, interrupts, the boot loop
+- `ms45emu/cpu.py`      SRR0/SRR1, TB/DEC and EIE/EID, which Unicorn does not expose
+- `ms45emu/qspi.py`, `ms45emu/qadc.py`  the QSPI/EEPROM and ADC models
 - `tests/`              the checks, one file per subject
 - `docs/`               notes on what a full boot would need
 
