@@ -23,6 +23,7 @@ RX_RAM = QSMCM + 0x140
 TX_RAM = QSMCM + 0x180
 CMD_RAM = QSMCM + 0x1C0
 QUEUE = 32
+BITSE = 0x40                 # command RAM: use SPCR0[BITS] instead of 8 bits
 
 SPE = 0x8000
 SPIFIE = 0x8000
@@ -102,6 +103,10 @@ class Qspi:
                 break
             q = (q + 1) % QUEUE
 
+        # Entry width: 8 bits unless BITSE is set in its command byte, then
+        # SPCR0[BITS] (0 = 16). An 8-bit entry sends the low byte only.
+        bits = (p.peek16(SPCR0) >> 10) & 0xF
+        wide = bits == 0 or bits > 8
         i = 0
         while i < len(entries):
             cmd = p.peek8(CMD_RAM + entries[i])
@@ -112,11 +117,14 @@ class Qspi:
                 i += 1
                 group.append(entries[i])
             i += 1
-            out = b"".join(struct.pack(">H", p.peek16(TX_RAM + 2 * e)) for e in group)
+            widths = [2 if (p.peek8(CMD_RAM + e) & BITSE and wide) else 1 for e in group]
+            out = b"".join(p.peek16(TX_RAM + 2 * e).to_bytes(2, "big")[-w:] for e, w in zip(group, widths))
             resp = self.devices[pcs].transaction(out)
             resp = resp.ljust(len(out), b"\xff")[:len(out)]
-            for k, e in enumerate(group):
-                p.poke16(RX_RAM + 2 * e, int.from_bytes(resp[2 * k:2 * k + 2], "big"))
+            k = 0
+            for e, w in zip(group, widths):
+                p.poke16(RX_RAM + 2 * e, int.from_bytes(resp[k:k + w], "big"))
+                k += w
             self.log.append((pcs, out.hex(), resp.hex()))
             if len(self.log) > 200:
                 self.log.pop(0)

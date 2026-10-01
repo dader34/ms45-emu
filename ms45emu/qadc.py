@@ -20,28 +20,33 @@ END_OF_QUEUE = 0x3F
 CF1, PF1, CF2, PF2 = 0x8000, 0x4000, 0x2000, 0x1000
 CIE1, SSE1, CIE2 = 0x8000, 0x2000, 0x8000
 
-# A scan of queue 2 every this many emulated instructions (~10 ms).
+# A scan of queue 2 every this many emulated instructions (~10 ms), and
+# how long a software-started queue 1 scan takes (~200 us).
 SCAN_INSTRUCTIONS = 400_000
+Q1_SCAN_INSTRUCTIONS = 8_000
 
 
 class Qadc:
-    def __init__(self, page, base, name):
+    def __init__(self, page, base, name, now=lambda: 0):
         self.p = page
+        self.now = now                # instruction counter, for scan timing
         self.base = base
         self.name = name
         self.channels = {}            # channel -> 10-bit value
         self.default = 0x200
         self.scans = 0
         self.single_scans = 0
-        self.q1_due = False           # a software scan was started; completes at the slice boundary
+        self.q1_due = False           # a software scan was started
+        self.q1_done_at = 0           # instruction count at which it completes
         self.queue2_started = False   # queue 2 switched on; the first scan follows at once
         page.on_write(base + QACR1, self._qacr1_write)
         page.on_write(base + QACR2, self._qacr2_write)
         write_zero_to_clear(page, base + QASR0)
 
     def _qacr1_write(self, addr, size, value):
-        if size == 2 and value & SSE1 and (value & 0x1F00):
+        if size == 2 and value & SSE1 and (value & 0x1F00) and not self.q1_due:
             self.q1_due = True
+            self.q1_done_at = self.now() + Q1_SCAN_INSTRUCTIONS
         return None
 
     def _qacr2_write(self, addr, size, value):
@@ -68,7 +73,7 @@ class Qadc:
 
     def service(self):
         """Complete a software-started queue 1 scan, if one is due."""
-        if self.q1_due:
+        if self.q1_due and self.now() >= self.q1_done_at:
             self.q1_due = False
             p = self.p
             p.poke16(self.base + QACR1, p.peek16(self.base + QACR1) & ~SSE1)

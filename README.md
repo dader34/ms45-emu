@@ -15,15 +15,24 @@ What it can do today:
 
 It also boots the whole program under `Board` (`ms45emu/board.py`), with
 models of the hardware around the CPU: open bus, watchdog, TPU
-acknowledgement, QSPI with a blank serial EEPROM, the MIOS interrupts the
-OS runs on, the ADC, and real exception delivery. The boot currently gets
-through the EEPROM load and into the init chain; `docs/full-boot.md` has
-the state of each piece and what is still missing.
+acknowledgement, QSPI with a serial EEPROM, the MIOS interrupts the OS runs
+on, the ADC, the time base and real exception delivery. The boot runs
+through the reset path, the EEPROM load and the init chain into the OS,
+whose periodic tasks then run on a 1 ms tick: the 10 ms CAN frame builder,
+the stored-data task, the map-switch hook. Switch the ignition off and the
+after-run writes the EEPROM and parks the CPU; boot again on that EEPROM
+and the DME comes up on the map that was saved. `docs/full-boot.md` has the
+state of each piece and what is still missing (CAN, the monitoring
+processor, anything the engine needs).
 
     from ms45emu import load_pair
     from ms45emu.board import Board
     b = Board(load_pair("stock"))
-    print(b.boot(max_insns=100_000_000), b.report())
+    b.probe(0x3B38C, "scheduler task")
+    print(b.boot(max_insns=20_000_000), b.report(), dict(b.probe_counts))
+    b.ignition(False)                      # KL15 off: the after-run starts
+
+A simulated second is 40 M instructions and takes about four seconds.
 
 ## Setup
 
@@ -43,7 +52,7 @@ The patched pair is what the BMWeb Flasher's Map Switch view saves.
 - `ms45emu/board.py`    the board around the CPU: peripherals, interrupts, the boot loop
 - `ms45emu/cpu.py`      SRR0/SRR1, TB/DEC and EIE/EID, which Unicorn does not expose
 - `ms45emu/qspi.py`, `ms45emu/qadc.py`  the QSPI/EEPROM and ADC models
-- `tests/`              the checks, one file per subject
+- `tests/`              the checks, one file per subject (`test_boot.py` is the full boot; the ignition-off round trip needs `MS45_SLOW=1`)
 - `docs/`               notes on what a full boot would need
 
 Related: the map-switch trace notes in `~/Desktop/e46bins/MS45-DME/Research`

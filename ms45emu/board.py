@@ -9,7 +9,7 @@ delivered at those sites and at slice boundaries.
 from collections import Counter
 
 from unicorn import (UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE_UNMAPPED, UC_HOOK_MEM_FETCH_UNMAPPED,
-                     UC_HOOK_INTR, UcError)
+                     UC_HOOK_MEM_WRITE, UC_HOOK_INTR, UC_PROT_READ, UC_PROT_WRITE, UcError)
 from unicorn.ppc_const import UC_PPC_REG_MSR, UC_PPC_REG_PC
 
 from .machine import Machine
@@ -46,8 +46,15 @@ PWM2_BIT = 0x0004                # MIOS1 bank 0 bit 2: the OS tick
 LEVEL_TPU, LEVEL_QADC, LEVEL_QSPI, LEVEL_MIOS = 3, 7, 9, 13
 
 INTERRUPT_NEST = 0x3FA0E4        # the program's own EID/EIE nesting counter
+KL15_CHANNEL = 55                # QADC B: ignition sense
+KL15_FLAG = 0x3FD853             # the DME's "KL15 on" state byte
+RAM_START, RAM_END = 0x3F8000, 0x400000
 
-CLOCKS_PER_TICK = 4              # TB and DEC run at sysclk/4; 1 instruction = 1 clock
+# TB and DEC clock. The kernel tick is 2500 time-base units, the scheduler
+# runs every 5 ticks and the 10 ms CAN frame 0x316 every 10, so a tick is
+# 1 ms and the time base runs at 2.5 MHz: the 40 MHz core clock divided by
+# 16. 1 instruction = 1 clock here.
+CLOCKS_PER_TICK = 16
 SLICE = 20_000
 TICK_INSTRUCTIONS = 400_000      # the OS tick (MIOS PWM2 period), about 10 ms
 
@@ -69,8 +76,11 @@ class OpenBus:
     def _unmapped(self, mu, access, addr, size, value, ud):
         page = addr & ~(self.PAGE - 1)
         if page not in self.pages:
-            mu.mmio_map(page, self.PAGE, lambda uc, off, sz, ud: (1 << (8 * sz)) - 1, None,
-                        lambda uc, off, sz, val, ud: None, None)
+            # Plain RAM, not executable, with writes undone so reads stay 0xFF.
+            mu.mem_map(page, self.PAGE, UC_PROT_READ | UC_PROT_WRITE)
+            mu.mem_write(page, b"\xff" * self.PAGE)
+            mu.hook_add(UC_HOOK_MEM_WRITE, lambda uc, a, ad, sz, v, u: uc.mem_write(ad, b"\xff" * sz),
+                        begin=page, end=page + self.PAGE - 1)
             self.pages.add(page)
         return True
 
@@ -94,6 +104,13 @@ class Board:
         # TBSCR status bits are write-1-to-clear; the rest is a control register.
         self.siu.on_write(TBSCR, lambda a, size, value: (self.siu.peek16(TBSCR) & ~(value & (TB_REFA | TB_REFB))) & 0xFF3F | (value & 0xFF3F) if size == 2 else None)
         self.tb_interrupts = 0
+        self.tb_late_refs = 0
+        self.tb_irq_enabled = True
+        # A reference written already behind TB would only match after a
+        # wrap; the kernel checks for that itself (mftb after the write) and
+        # moves on, so it is only counted here.
+        for ref, flag in ((TBREF0, TB_REFA), (TBREF1, TB_REFB)):
+            self.siu.on_write(ref, lambda a, size, value, flag=flag: self._tbref_write(size, value, flag))
         self.siu.on_read(SIPEND, lambda a, s: self.pending_external())
 
         # TPU: host service requests are acknowledged at once; CISR is write-0-to-clear
@@ -106,8 +123,9 @@ class Board:
 
         # QSPI with the EEPROM, ADCs
         self.qspi = Qspi(self.imb)
-        self.adc_a = Qadc(self.imb, QADC_A, "A")
-        self.adc_b = Qadc(self.imb, QADC_B, "B")
+        self.adc_a = Qadc(self.imb, QADC_A, "A", lambda: self.instructions)
+        self.adc_b = Qadc(self.imb, QADC_B, "B", lambda: self.instructions)
+        self.ignition(True)
 
         # MIOS interrupts: status registers write-0-to-clear, request = status & enable,
         # bank-1 bit 6 always asserted (the OS's software interrupt).
@@ -133,9 +151,56 @@ class Board:
         # the `sc` that replaced each EIE/EID/NRI, and any real `sc`.
         self.syscalls = 0
         self.other_exceptions = Counter()
+        self.probes = {}
+        self.probe_counts = Counter()
         m.mu.hook_add(UC_HOOK_INTR, self._intr)
 
+    # ---- probes -----------------------------------------------------------
+    def probe(self, addr, name=None, on_hit=None):
+        """Count executions of the instruction at addr without a code hook:
+        it is replaced by `sc` and emulated in the exception hook. Only the
+        usual function-entry instructions are supported (stwu r1,..(r1),
+        mflr r0, and simple li/lbz/lhz/lwz/addi forms). on_hit(board) is
+        called before the instruction is emulated, with the registers as
+        they were on entry."""
+        from unicorn.ppc_const import UC_PPC_REG_LR
+        w = self.m.read32(addr)
+        op = w >> 26
+        rt, ra, d = (w >> 21) & 31, (w >> 16) & 31, w & 0xFFFF
+        if d & 0x8000:
+            d -= 0x10000
+        if w == 0x7C0802A6:
+            fn = lambda m: m.set_reg(0, m.mu.reg_read(UC_PPC_REG_LR))
+        elif op == 37 and rt == 1 and ra == 1:                    # stwu r1,d(r1)
+            def fn(m, d=d):
+                sp = (m.reg(1) + d) & 0xFFFFFFFF
+                m.write32(sp, m.reg(1)); m.set_reg(1, sp)
+        elif op == 14:                                              # addi / li
+            fn = lambda m, rt=rt, ra=ra, d=d: m.set_reg(rt, (m.reg(ra) if ra else 0) + d)
+        elif op == 15:                                              # addis / lis
+            fn = lambda m, rt=rt, ra=ra, d=d: m.set_reg(rt, (m.reg(ra) if ra else 0) + (d << 16))
+        elif op in (32, 34, 40):                                    # lwz / lbz / lhz
+            size = {32: 4, 34: 1, 40: 2}[op]
+            fn = lambda m, rt=rt, ra=ra, d=d, size=size: m.set_reg(rt, int.from_bytes(m.read(((m.reg(ra) if ra else 0) + d) & 0xFFFFFFFF, size), "big"))
+        else:
+            raise ValueError(f"probe at 0x{addr:X}: unsupported instruction {w:08X}")
+        self.m.write32(addr, 0x44000002)
+        if on_hit is not None:
+            inner = fn
+            def fn(m, inner=inner, on_hit=on_hit):
+                on_hit(self)
+                inner(m)
+        self.probes[(addr + 4) & 0xFFFFFFFF] = (name or f"0x{addr:X}", fn)
+        self.probe_counts[name or f"0x{addr:X}"] = 0
+
     # ---- register handlers -----------------------------------------------
+    def _tbref_write(self, size, value, flag):
+        if size == 4 and self.siu.peek16(TBSCR) & 0x1:
+            behind = (self.cpu.tb - value) & 0xFFFFFFFF
+            if 0 < behind < 0x80000000:
+                self.tb_late_refs += 1
+        return None
+
     def _swsr_write(self, addr, size, value):
         if value == SWSR_SEQUENCE[self._wd_expect]:
             self._wd_expect ^= 1
@@ -149,6 +214,17 @@ class Board:
     def _hsrr_write(self, addr, size, value):
         if value:
             self.tpu_requests += 1
+            # Each channel's request is "serviced": the DME's own microcode
+            # reports completion in parameter word 7 (bit 13) of the channel,
+            # which some drivers wait for. HSRR1 holds channels 15-8, HSRR0
+            # channels 7-0, two bits per channel.
+            tpu = 0x304000 if addr < 0x304400 else 0x304400
+            first = 8 if addr in (0x304018, 0x304418) else 0
+            for i in range(8):
+                if (value >> (2 * i)) & 3:
+                    ch = first + i
+                    w7 = tpu + 0x100 + ch * 16 + 0xE
+                    self.imb.poke16(w7, self.imb.peek16(w7) | 0x2000)
         return 0                                  # serviced before it can be read back
 
     def _er1_write(self, addr, size, value):
@@ -172,21 +248,29 @@ class Board:
             pend |= 0x80000000 >> LEVEL_TPU
         if self.adc_a.interrupt_pending() or self.adc_b.interrupt_pending():
             pend |= 0x80000000 >> LEVEL_QADC
-        # The time base reference compare sets its status flags (above) but
-        # is not routed to the SIU: neither level reading of TBIRQ matched a
-        # handler that acknowledges it, so the program evidently polls it.
+        tbscr = self.siu.peek16(TBSCR)
+        if self.tb_irq_enabled and ((tbscr & TB_REFA and tbscr & TB_REFAE) or (tbscr & TB_REFB and tbscr & TB_REFBE)):
+            level = self._tb_level(tbscr)
+            if level is not None:
+                pend |= 0x80000000 >> (2 * level + 1)
         return pend
 
     @staticmethod
     def _tb_level(tbscr):
-        """TBIRQ (bits 15-8) is one-hot: bit value (1 << level)."""
+        """TBIRQ (bits 15-8) is one-hot; bit value 0x80 selects level 0,
+        0x40 level 1, ... 0x01 level 7."""
         irq = (tbscr >> 8) & 0xFF
         for level in range(8):
-            if irq & (1 << level):
+            if irq & (0x80 >> level):
                 return level
         return None
 
     def _can_interrupt(self):
+        # Not while a raise stub is still pending: it has yet to load SRR0/
+        # SRR1 for the previous exception, and a second raise would clobber
+        # them.
+        if self.cpu.in_stub(self.m.pc):
+            return False
         return self.cpu.interrupts_enabled() and self.m.read32(INTERRUPT_NEST) == 0
 
     def _deliver(self):
@@ -225,6 +309,11 @@ class Board:
             return
         site = self.cpu.sc_sites.get(pc)            # pc is already past the sc
         if site is None:
+            probe = self.probes.get(pc)
+            if probe is not None:
+                self.probe_counts[probe[0]] += 1
+                probe[1](self.m)
+                return
             # A real system call: vector it as the hardware would.
             self.syscalls += 1
             self.cpu.raise_exception(VEC_SYSCALL)
@@ -246,9 +335,20 @@ class Board:
         so its exception lands close to the right moment: the kernel reads
         DEC afterwards as the (small, negative) overshoot."""
         dec = self.cpu.read_dec()
-        if dec < 0x80000000 and dec * CLOCKS_PER_TICK < SLICE:
-            return max(dec * CLOCKS_PER_TICK + CLOCKS_PER_TICK, 64)
-        return SLICE
+        n = SLICE
+        if dec < 0x80000000 and dec * CLOCKS_PER_TICK < n:
+            n = dec * CLOCKS_PER_TICK + CLOCKS_PER_TICK
+        # Likewise the time base reference compares, so their status bit is
+        # set at the right instruction rather than at the end of a slice.
+        tbscr = self.siu.peek16(TBSCR)
+        if tbscr & 0x1:
+            tb = self.cpu.tb & 0xFFFFFFFF
+            for ref, enable in ((TBREF0, TB_REFAE), (TBREF1, TB_REFBE)):
+                if tbscr & enable:
+                    ahead = (self.siu.peek32(ref) - tb) & 0xFFFFFFFF
+                    if ahead * CLOCKS_PER_TICK < n:
+                        n = ahead * CLOCKS_PER_TICK + CLOCKS_PER_TICK
+        return max(n, 64)
 
     def _slice_boundary(self, ran):
         self.instructions += ran
@@ -282,6 +382,32 @@ class Board:
         self._deliver()
 
     # ---- running ------------------------------------------------------------
+    # ---- the car around the DME ----------------------------------------------
+    def ignition(self, on):
+        """KL15 is an analogue input: QADC B channel 55, found by switching
+        channels low one at a time and watching the DME's KL15 flag."""
+        self.adc_b.channels[KL15_CHANNEL] = 0x3C0 if on else 0x40
+
+    @property
+    def kl15(self):
+        return bool(self.m.read8(KL15_FLAG))
+
+    @property
+    def powered_down(self):
+        """After the after-run the DME parks in a loop copied to RAM and
+        waits for the main relay to drop."""
+        return RAM_START <= self.m.pc < RAM_END
+
+    def eeprom_image(self):
+        return bytes(self.qspi.eeprom.data)
+
+    def load_eeprom(self, image):
+        self.qspi.eeprom.data[:len(image)] = image
+
+    def run(self, max_insns):
+        """Keep running from where the program is."""
+        return self.run_from(self.m.pc, max_insns)
+
     def boot(self, max_insns=5_000_000, until=BOOT_IDLE):
         """Run the reset path in slices. Returns (reached_idle, reason)."""
         self.m.mu.reg_write(UC_PPC_REG_MSR, 0)
@@ -314,7 +440,7 @@ class Board:
         return (f"watchdog services={self.watchdog_services} bad={self.watchdog_bad}; "
                 f"tpu requests={self.tpu_requests}; qspi transfers={self.qspi.transfers} "
                 f"(eeprom reads={self.qspi.eeprom.reads} writes={self.qspi.eeprom.writes}); "
-                f"events posted={self.events_posted}; ticks={self.ticks}; tb compares={self.tb_interrupts}; fp enables={self.fp_enables}; "
+                f"events posted={self.events_posted}; ticks={self.ticks}; tb compares={self.tb_interrupts} (late refs {self.tb_late_refs}); fp enables={self.fp_enables}; "
                 f"adc scans={self.adc_a.scans}/{self.adc_b.scans} single={self.adc_a.single_scans}; "
                 f"interrupts={dict(self.interrupts_taken)} dec={self.dec_exceptions} "
                 f"syscalls={self.syscalls} other exceptions={dict(self.other_exceptions)}; "
