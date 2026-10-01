@@ -35,6 +35,8 @@ RAM_HOLD = 0x3FA196
 RAM_DISP8 = 0x3FA1ED
 RAM_DISP16 = 0x3FA1EE
 
+CAN_ASC1_STORE = 0x3FDCAC                # where the CAN layer keeps the last 0x153, byte-reversed
+
 TACH_STORE_ADDR = 0x4B6C4                # sth r3,-0x3B28(r13) in the 0x316 builder, hooked by the patch
 NV_DESCRIPTOR = 0x28AC + 56 * 0x1C       # init, restore, save pointers
 

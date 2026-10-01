@@ -34,6 +34,13 @@ processor, anything the engine needs).
 
 A simulated second is 40 M instructions and takes about four seconds.
 
+The DME is on its CAN bus as well: it sends the real DME1-4 frames
+(0x316 with the rpm the cluster shows, every 10 ms) and takes the ASC,
+cluster and gearbox frames in; `ms45emu/e46.py` plays those partners.
+`tools/bench.py` puts the emulated DME on a real bus through a USB-CAN
+adapter (python-can), so a cluster on the bench, or the car with its DME
+unplugged, follows the emulator.
+
 ## Setup
 
     python3.11 -m venv .venv            # or newer
@@ -51,7 +58,9 @@ The patched pair is what the BMWeb Flasher's Map Switch view saves.
 - `ms45emu/dme.py`      traced addresses and helpers for this program
 - `ms45emu/board.py`    the board around the CPU: peripherals, interrupts, the boot loop
 - `ms45emu/cpu.py`      SRR0/SRR1, TB/DEC and EIE/EID, which Unicorn does not expose
-- `ms45emu/qspi.py`, `ms45emu/qadc.py`  the QSPI/EEPROM and ADC models
+- `ms45emu/qspi.py`, `ms45emu/qadc.py`, `ms45emu/toucan.py`  the QSPI/EEPROM, ADC and CAN models
+- `ms45emu/e46.py`      the other modules on the E46's bus
+- `tools/bench.py`      the DME on a real CAN adapter
 - `tests/`              the checks, one file per subject (`test_boot.py` is the full boot; the ignition-off round trip needs `MS45_SLOW=1`)
 - `docs/`               notes on what a full boot would need
 

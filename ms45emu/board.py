@@ -16,6 +16,7 @@ from .machine import Machine
 from .periph import MmioPage, write_zero_to_clear
 from .qspi import Qspi
 from .qadc import Qadc, QADC_A, QADC_B, SCAN_INSTRUCTIONS
+from .toucan import TouCan
 from .cpu import Cpu, VEC_EXTERNAL, VEC_DECREMENTER, VEC_SYSCALL, MSR_FP, SPR_EIE
 
 RESET_ENTRY = 0xFFF717B4         # the boot code after the reset vector's setup
@@ -25,6 +26,7 @@ BOOT_IDLE = 0xFFF717FC           # `b .` at the end of the boot sequence
 SIU_PAGE = 0x2FC000              # SIU, memory controller, timers
 TPU_QADC_QSMCM_PAGE = 0x304000   # TPU A/B, QADC A/B, QSMCM: 0x304000-0x305FFF
 MIOS_PAGE = 0x306000
+CAN_PAGE = 0x307000              # TouCAN A at +0x80, B at +0x480
 
 SWSR = 0x2FC00E
 TBSCR, TBREF0, TBREF1 = 0x2FC200, 0x2FC204, 0x2FC208
@@ -126,6 +128,11 @@ class Board:
         self.adc_a = Qadc(self.imb, QADC_A, "A", lambda: self.instructions)
         self.adc_b = Qadc(self.imb, QADC_B, "B", lambda: self.instructions)
         self.ignition(True)
+
+        # CAN: A is the vehicle bus, B the second module
+        self.canp = MmioPage(m, CAN_PAGE, 0x1000)
+        self.can_a = TouCan(self.canp, CAN_PAGE + 0x80, "A", lambda: self.instructions)
+        self.can_b = TouCan(self.canp, CAN_PAGE + 0x480, "B", lambda: self.instructions)
 
         # MIOS interrupts: status registers write-0-to-clear, request = status & enable,
         # bank-1 bit 6 always asserted (the OS's software interrupt).
@@ -248,6 +255,10 @@ class Board:
             pend |= 0x80000000 >> LEVEL_TPU
         if self.adc_a.interrupt_pending() or self.adc_b.interrupt_pending():
             pend |= 0x80000000 >> LEVEL_QADC
+        for can in (self.can_a, self.can_b):
+            level = can.interrupt_level()
+            if level is not None:
+                pend |= 0x80000000 >> (2 * level + 1)
         tbscr = self.siu.peek16(TBSCR)
         if self.tb_irq_enabled and ((tbscr & TB_REFA and tbscr & TB_REFAE) or (tbscr & TB_REFB and tbscr & TB_REFBE)):
             level = self._tb_level(tbscr)
@@ -442,6 +453,7 @@ class Board:
                 f"(eeprom reads={self.qspi.eeprom.reads} writes={self.qspi.eeprom.writes}); "
                 f"events posted={self.events_posted}; ticks={self.ticks}; tb compares={self.tb_interrupts} (late refs {self.tb_late_refs}); fp enables={self.fp_enables}; "
                 f"adc scans={self.adc_a.scans}/{self.adc_b.scans} single={self.adc_a.single_scans}; "
+                f"can A tx={self.can_a.tx_count} rx={self.can_a.rx_count} B tx={self.can_b.tx_count} rx={self.can_b.rx_count}; "
                 f"interrupts={dict(self.interrupts_taken)} dec={self.dec_exceptions} "
                 f"syscalls={self.syscalls} other exceptions={dict(self.other_exceptions)}; "
                 f"open-bus pages={sorted(hex(p) for p in self.bus.pages)}")

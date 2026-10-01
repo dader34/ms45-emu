@@ -26,9 +26,14 @@ that EEPROM image brings the DME up on the saved map, with the 2000 rpm
 indication. `tests/test_boot.py` covers all of it; the ignition-off round
 trip is behind `MS45_SLOW=1`.
 
-Not yet: anything the engine needs (TPU microcode, crank/cam), CAN in
-either direction, the monitoring processor. The CAN-receive task never
-runs, so "message missing" faults are to be expected in the fault memory.
+CAN runs too (`ms45emu/toucan.py`): module A is the vehicle bus, where
+the DME sends DME1-4 (0x316 every 10 ms with the rpm the cluster shows,
+0x329, 0x545, and 0x338 on events) and receives ASC, cluster and gearbox
+frames; `ms45emu/e46.py` plays those partners, and `tools/bench.py` puts
+the DME on a real bus through a python-can adapter.
+
+Not yet: anything the engine needs (TPU microcode, crank/cam), the
+monitoring processor, K-line.
 
 Speed: a simulated second is 40 M instructions and takes about 4 s of wall
 time; most of that is Python handling interrupts and QSPI transfers, not
@@ -70,6 +75,7 @@ image (`checksums.py`).
 | Interrupt levels | `pending_external()` derives SIPEND from device state, masked by SIMASK | Level-triggered, taken at instruction boundaries when EE allows and the program's nesting counter is zero |
 | Time base, decrementer | advanced from the instruction count; see Time | |
 | FPU | FP-unavailable exception handled by enabling MSR[FP] and re-running the instruction | |
+| CAN | `TouCan` x2 on `0x307000` | Message buffers with codes, acceptance masks, IFLAG/ESTAT write-0-to-clear, interrupt level from ICR (module B, level 5), 16-bit timer. Transmit is immediate; frames go to `tx_log`/`on_tx`, `receive()` lands a frame in the first matching empty buffer |
 | Probes | `Board.probe(addr, name, on_hit)` | Entry instruction replaced by `sc` and emulated; counts calls at no per-instruction cost; `on_hit` sees the registers on entry |
 
 ## Things learned about the firmware
@@ -99,6 +105,16 @@ image (`checksums.py`).
   `0xFFFF8B1C`; the time-based ones through the scheduler task `0x3B38C`.
 - The stored data is written to the EEPROM in the after-run only, each
   record twice, with a read-back; the EEPROM is otherwise read at boot.
+- CAN A message buffers: 0-10 receive 0x43F, 0x613, 0x615, 0x153, 0x1F3,
+  (unused), 0x1F5, 0x43B, 0x1F8, (unused), 0x43D; 11-14 transmit 0x545,
+  0x338, 0x329, 0x316. CAN B carries 0x7E8-0x7ED and a few others, with
+  interrupts enabled. Module A is polled: the application calls the
+  receive routine `0x2A8D8` per message handle every 10 ms, reads the
+  buffer through `0x2B598` and stores the frame byte-reversed (0x153 at
+  `0x3FDCAC`), so little-endian fields read naturally on the PowerPC.
+- Vehicle speed (`-0x3F95`) is a TPU-measured pulse input, not CAN, unless
+  `-0x3D1E` selects the CAN value; brake is MIOS pin state (DASM 12/15);
+  the pedal is ADC.
 - The kernel also programs the PIT (PISCR 0x105 / 0x1 from `0x101BC` /
   `0x1094C`); it is not modelled and nothing has needed it.
 
@@ -106,9 +122,9 @@ image (`checksums.py`).
 
 | Piece | Why it matters |
 |---|---|
-| CAN (TouCAN at `0x307000`) | No frames leave or arrive; needed for a bench DME on a real bus |
 | Monitoring processor (SPI, not PCS1) | Its handshake will be needed before the DME considers itself healthy |
 | SCI (K-line) | Diagnostics |
+| Vehicle speed pulse (TPU) | Stays at 0 km/h |
 | Realistic ADC values per channel | All channels read mid-scale; pedal/brake/speed are forced at the hook in the tests |
 | Watchdog reset | Services are counted but a missed one does nothing |
 | Crank and cam (TPU microcode) | Engine running only |

@@ -21,6 +21,7 @@ class MmioPage:
         self.data = bytearray(size)
         self.readers = {}            # addr -> fn(addr, size) -> value or None
         self.writers = {}            # addr -> fn(addr, size, value) -> stored value or None
+        self.trace = None            # fn(kind, addr, size, value) for every access, when set
         machine.mu.mmio_map(base, size, self._read, None, self._write, None)
 
     # ---- raw backing ------------------------------------------------------
@@ -43,14 +44,17 @@ class MmioPage:
     def _read(self, uc, offset, size, ud):
         addr = self.base + offset
         fn = self.readers.get(addr)
-        if fn is not None:
-            v = fn(addr, size)
-            if v is not None:
-                return v
-        return self.peek(addr, size)
+        v = fn(addr, size) if fn is not None else None
+        if v is None:
+            v = self.peek(addr, size)
+        if self.trace is not None:
+            self.trace("R", addr, size, v)
+        return v
 
     def _write(self, uc, offset, size, value, ud):
         addr = self.base + offset
+        if self.trace is not None:
+            self.trace("W", addr, size, value)
         fn = self.writers.get(addr)
         if fn is not None:
             v = fn(addr, size, value)
