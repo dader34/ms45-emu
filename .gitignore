@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.pytest_cache/
+# BMW-derived flash images never go in the repo
+images/*
+!images/README.md

@@ -1,0 +1,15 @@
+[project]
+name = "ms45emu"
+version = "0.1.0"
+description = "Routine-level emulation of the Siemens MS45.1 DME (MPC555) for testing firmware patches"
+requires-python = ">=3.11"
+dependencies = ["unicorn>=2.1", "capstone>=5"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+packages = ["ms45emu"]
