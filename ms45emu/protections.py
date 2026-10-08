@@ -30,7 +30,22 @@ LIMP_HOME_FLAG = R13 - 0x4059    # the brake/throttle plausibility fault flag
 LIMP_HOME = R13 - 0x406B         # limp home limit in force (c_n_max_mtc_lih)
 ENGINE_STATE = 0x3F9C43
 WATCHED = OrderedDict([(LIMP_HOME_FLAG, "limp_home_flag"), (LIMP_HOME, "limp_home"), (ENGINE_STATE, "engine_state")])
-IDLE_RPM = 800                   # where a scenario synchronises the crank before going faster
+# The self-check the program runs before each answer to the monitoring
+# module (fn_FFF76ED4, program 0044570LO02S; docs/protections.md). Any
+# condition failing makes fn_FFFD2968 count an MO3 error and store to
+# 0x800000, a machine check: the DME resets itself and stores no fault.
+# code -> (what, test on the flag bytes by r13 offset)
+SELF_RESET_CHECKS = {
+    12: ("boot RAM test (r13-0x65B7/-0x65B6)", lambda v: v[0x65B7] == 0 and v[0x65B6] == 0xFF),
+    11: ("program checksum, selftest_checksum (r13-0x3B8F)", lambda v: v[0x3B8F] == 0),
+    10: ("a level-2 safety monitor check (r13-0x3D90/-0x3D8F)", lambda v: v[0x3D90] == 0 and v[0x3D8F] != 0),
+    9: ("calibration ROM test of the monitoring level (r13-0x3C13)", lambda v: v[0x3C13] == 0),
+}
+SELF_RESET_FLAGS = (0x65B7, 0x65B6, 0x3B8F, 0x3D90, 0x3D8F, 0x3C13)
+MO3_ERROR = 0xFFFD2968           # the self-reset itself (r3 = code)
+MO3_ANSWER = 0xFFF76F80          # the answer routine, every 10 ms from task22
+
+IDLE_RPM = 800                  # where a scenario synchronises the crank before going faster
 FAILED_MASK = 0x0F              # r4: 0x10 is "tested"; a low bit is the way it failed
 
 
@@ -153,6 +168,15 @@ class Reactions:
         self.hang_sites = {pc for pc, w in self.fm.words.items() if w == 0x48000000}
         mu = board.m.mu
         self._hooks = [mu.hook_add(UC_HOOK_MEM_WRITE, self._flag_write, begin=addr, end=addr) for addr in WATCHED]
+        # The self-reset: its checks evaluated each time the program is
+        # about to answer the monitoring module (the flags pass through bad
+        # values while the boot initialises them, which it never looks at),
+        # and the recorder itself, reached only with the module talking.
+        self.self_reset = {}               # code -> instruction count it first failed at
+        self.mo3_errors = Counter()        # codes fn_FFFD2968 was called with
+        if board.m.pair.traced:
+            board.probe(MO3_ANSWER, "mo3_answer", on_hit=self._self_check)
+            board.probe(MO3_ERROR, "mo3_error", on_hit=lambda bd: self.mo3_errors.update([bd.m.reg(3)]))
         mu.ctl_flush_tb()
         self._last = {addr: board.m.read8(addr) for addr in WATCHED}
 
@@ -162,6 +186,12 @@ class Reactions:
         if verdict & FAILED_MASK:
             self.failed[idx] += 1
             self.first_failed.setdefault(idx, board.instructions)
+
+    def _self_check(self, board):
+        flags = {off: board.m.read8(R13 - off) for off in SELF_RESET_FLAGS}
+        for code, (_, ok) in SELF_RESET_CHECKS.items():
+            if code not in self.self_reset and not ok(flags):
+                self.self_reset[code] = board.instructions
 
     def _flag_write(self, mu, access, addr, size, value, ud):
         v = value & 0xFF
@@ -219,8 +249,10 @@ class Reactions:
 
     @property
     def reset(self):
-        """A reset on hardware: the watchdog went unserviced, the CPU hung, or an exception was not handled."""
-        return bool(self.watchdog_stalls) or self.hang is not None or bool(self.exceptions)
+        """A reset on hardware: the watchdog went unserviced, the CPU hung,
+        an exception was not handled, or the program's own pre-answer
+        self-check failed (it resets itself, storing nothing)."""
+        return bool(self.watchdog_stalls) or self.hang is not None or bool(self.exceptions) or bool(self.self_reset)
 
     def report(self, faults=None):
         b = self.board
@@ -228,6 +260,8 @@ class Reactions:
                + (f", UNSERVICED at {[f'{i / b.ips:.3f} s' for i, _ in self.watchdog_stalls[:3]]}" if self.watchdog_stalls else "")
                + (f"; HUNG at 0x{self.hang:X} ({self.fm.label(self.hang)})" if self.hang is not None else "")
                + (f"; exceptions {dict(self.exceptions)}" if self.exceptions else "")]
+        for code, at in sorted(self.self_reset.items()):
+            out.append(f"SELF-RESET (MO3 code {code}: {SELF_RESET_CHECKS[code][0]}) at {at / b.ips:.3f} s: the DME resets itself, no fault stored")
         out.append(f"faults reported: {len(self.reports)}, failed: {len(self.failed)}")
         for idx, n in sorted(self.failed.items()):
             verdicts = " ".join(f"{v:02X}x{c}" for v, c in sorted(self.reports[idx].items()))
@@ -241,6 +275,9 @@ class Reactions:
 def compare(base, other, faults=None):
     """What `other` did that `base` did not: the lines a custom program must explain."""
     out = []
+    for code in sorted(set(other.self_reset) - set(base.self_reset)):
+        out.append(f"self-reset: MO3 code {code}, {SELF_RESET_CHECKS[code][0]}, at "
+                   f"{other.self_reset[code] / other.board.ips:.3f} s (the DME resets itself and stores no fault)")
     for idx in sorted(set(other.failed) - set(base.failed)):
         out.append(f"fails {faults.describe(idx) if faults else f'fault {idx}'} ({other.failed[idx]}x, first at {other.first_failed[idx] / other.board.ips:.3f} s); the base does not")
     for name in WATCHED.values():

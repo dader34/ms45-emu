@@ -11,6 +11,8 @@ from ms45emu.protections import Checks, Reactions, compare
 from ms45emu.xdf import Xdf
 
 SCENARIO = dict(rpm=800, seconds=0.5, settle=0.5)
+STALE_AT = 0xFFFDC860             # free space inside the program checksum's range, never executed
+STALE_SECONDS = 6
 
 
 @pytest.fixture(scope="module")
@@ -34,6 +36,22 @@ def test_stock_baseline(stock, stock_reactions):
     assert not r.reset, r.report(Faults(stock.pair))
     assert r.reports, "the fault reporter was never entered"
     assert 97 in r.reports                                      # the crank sensor check runs with the crank turning
+
+
+def test_stock_never_fails_its_self_check(stock_reactions):
+    assert stock_reactions.self_reset == {}
+
+
+def test_a_stale_program_checksum_is_a_self_reset(stock):
+    """One word changed in the program and its sums left as they were: the
+    background checksum fails, the pre-answer self-check with it, and the
+    DME would reset itself without a code (the start-up resets of an early
+    map-switch build)."""
+    b = Board(stock.pair)                 # sums refreshed over the emulator's own patches here ...
+    b.m.write32(STALE_AT, 0x12345678)     # ... and then a word in the program area changed
+    r = Reactions(b)
+    r.scenario(rpm=0, seconds=STALE_SECONDS, settle=0.5)
+    assert 11 in r.self_reset, r.report(Faults(stock.pair))
 
 
 def test_checks_table(stock):

@@ -205,6 +205,36 @@ monitoring module ("level 3", MO3) on the SPI. The facts:
   after boot and then waits for an answer that never comes (receive RAM
   reads `FF`), so nothing past that is exercised.
 
+**The reset itself is the DME's own** (`fn_FFFD2968`). Before each
+answer the program runs a self-check (`fn_FFF76ED4`) of four conditions;
+any failing one goes to `fn_FFFD2968(code)`, which counts it in
+r13-0x773E and, up to the eighth time, does `mtmsr 0` and a store to
+`0x800000`, an address with nothing behind it: a machine check, so the
+CPU restarts, storing nothing. After eight it stays in the `3B` state
+for good. The four:
+
+| Code | Fails when | Set by |
+|---|---|---|
+| 12 | r13-0x65B7 != 0 or r13-0x65B6 != ~it | the boot RAM test (`fn_FFF71924`) |
+| 11 | r13-0x3B8F != 0 | `selftest_checksum`: the program's CRC-32 |
+| 10 | r13-0x3D90 != 0 or r13-0x3D8F == 0 | any of the 28 level-2 safety-monitor checks (`monitor_n_max` among them), through the debouncers `fn_F50C`/`fn_F590` |
+| 9 | r13-0x3C13 != 0 | `fn_FFFD2D34`, the monitoring level's calibration ROM test (`val_mo3_cal_cks_*`, `romtest_accumulate`): the "ROM test level 2" sum that reset the early map-switch builds |
+
+Other codes (1-5) are the module's replies not matching. `Reactions`
+evaluates the four at every entry of `mo3_answer` and reports a
+**self-reset**; `compare()` lists one the stock pair does not have.
+Checked: the stock and map-switch pairs never fail it; a word changed
+in the program area after the sums were made (`tests/test_protections.py`)
+fails code 11 after 5 s, together with fault 38. The emulator's own
+`0x800000` store is swallowed by the open bus, so the run goes on past
+the moment the car would reset.
+
+The minimal monitoring-module model tried for the dialog (echo the
+message type, XOR, byte 4 = 1) gets past the reply checks to code 3,
+which wants the IRQ2 pin (`fn_11BAC`) and two status bits from the PCS2
+sequence driver (r13-0x766C); not pursued, since the self-check above
+covers the resets that come from the program.
+
 Most likely, then, the cold hook changed what the level-2 monitor
 computed (a lower `N_max` than the copy of the limiter in the monitor
 expects, or a different path through `monitor_n_max`), its answers to

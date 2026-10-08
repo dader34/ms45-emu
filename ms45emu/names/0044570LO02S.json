@@ -72,6 +72,8 @@
     "0xFFF76F80": "mo3_answer",
     "0x2A2B0": "mo3_send_frame",
     "0x2A3AC": "mo3_receive",
+    "0xFFF76ED4": "mo3_self_check",
+    "0xFFFD2968": "mo3_self_reset",
     "0x1B538": "pwm_duty_update",
     "0x1CC7C": "os_event_drain",
     "0x1F938": "ignition_fire_b",
