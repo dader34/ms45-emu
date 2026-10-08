@@ -96,6 +96,39 @@ which is the baseline and a list of what the board does not model yet:
 A reset never happens on the stock pair: the watchdog is serviced 10 ms
 after 10 ms, no exception, no hang.
 
+## The ignition checks and the TPU
+
+Faults 53-64 (coils, ignition per cylinder) come from `ignition_diagnosis`
+(`0x34648`, segment task), which per cylinder takes `ignition_word4`
+(word 4 of the cylinder's TPU channel, through the channel table at
+r13-0x74D4) and `ignition_fired_flag` (bit per cylinder at r13-0x74AE,
+cleared on reading). Nothing sets that bit on the emulator, because the
+TPU's completion interrupts never come: `Tpu.on_service` only records
+the host service request.
+
+How they would come: the TPU interrupt (`tpu_interrupt`, SIU level 1)
+calls `tpu_dispatch` (`0x1F12C`), which takes CISR & CIER of both
+modules as 32 bits (A0-15 low, B0-15 high), clears each pending bit and
+calls the handler from the table at RAM `0x3FB058` (32 pointers, a byte
+argument each at +0x80): A0-5 `ignition_channel_handler` (arg = the
+cylinder), A6/9/11/15 and B9/15 `fn_164D8` (PWM), A10/A12 `cam_handler`
+(arg 0/1), A13 `crank_handler`, B14 `tpu_b14_capture_handler`, the rest
+a stub. `ignition_channel_handler` reads the channel's parameter RAM:
+byte 9 bit 0 as a status into r13-0x750C, word 5 as the angle the pulse
+happened at (it must equal one of four expected values 0x78 apart, else
+bit 2 of r13-0x74F4), word 6 as a duration summed into r13-0x7508. So an
+ignition model has to run the pulse the program schedules (words 0 and
+1, written by `fn_18870`/`fn_19058` from `ignition_fire_a`) against the
+crank angle, and on completion leave the angle in word 5, the duration
+in word 6, the status in byte 9 and raise the channel's CISR bit.
+Injecting the interrupt alone, with made-up words, sets nothing.
+
+The cam channels (A10, A12) never interrupt either: no edges are
+generated, so `cam_handler` (3.5 KB) never runs and the cam checks
+(`fn_FFF77EC4` in the segment task, `fn_FFFCD878`/`fn_FFFCDC94` in
+task10) fail on duration and phase. A cam model needs the microcode
+function D's parameter layout, from `cam_handler`.
+
 ## Next
 
 1. The output-stage IC's protocol on PCS0 (above), so that its self-test
