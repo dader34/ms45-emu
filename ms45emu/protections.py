@@ -30,7 +30,8 @@ LIMP_HOME_FLAG = R13 - 0x4059    # the brake/throttle plausibility fault flag
 LIMP_HOME = R13 - 0x406B         # limp home limit in force (c_n_max_mtc_lih)
 ENGINE_STATE = 0x3F9C43
 WATCHED = OrderedDict([(LIMP_HOME_FLAG, "limp_home_flag"), (LIMP_HOME, "limp_home"), (ENGINE_STATE, "engine_state")])
-FAILED_MASK = 0x0F               # r4: 0x10 is "tested"; a low bit is the way it failed
+IDLE_RPM = 800                   # where a scenario synchronises the crank before going faster
+FAILED_MASK = 0x0F              # r4: 0x10 is "tested"; a low bit is the way it failed
 
 
 # ---- static --------------------------------------------------------------------------------
@@ -195,7 +196,13 @@ class Reactions:
         the crank at rpm, and the ignition off when asked."""
         from .e46 import Peers
         b = self.board
-        b.crank.rpm = rpm
+        # With the cam sensors not modelled, the crank handler accepts the
+        # gap only at some speeds (it checks the cam levels against the
+        # segment it expects, and restarts the search on a mismatch), so a
+        # start straight at 1300 rpm may never synchronise. The engine
+        # passes through idle anyway: synchronise there, then speed up.
+        ramp = rpm > IDLE_RPM and not self.ran
+        b.crank.rpm = IDLE_RPM if ramp else rpm
         peers = Peers(b, automatic=automatic)
         if speed:
             peers.set_speed(speed)
@@ -203,6 +210,8 @@ class Reactions:
             b.boot(max_insns=b.ips // 1000)             # the reset entry; the rest of the boot runs watched
         if settle:
             self.run(int(settle * b.ips), run=lambda n: peers.run(n))
+        if ramp:
+            b.crank.rpm = rpm
         if key_off:
             b.ignition(False)
         self.run(int(seconds * b.ips), run=lambda n: peers.run(n))

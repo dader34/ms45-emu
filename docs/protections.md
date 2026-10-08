@@ -166,13 +166,22 @@ nothing different from stock with `N_max` forced to 500, 1000 or 3500:
 
 - the cut mask stays 0: `fn_52AD8`'s cut decision needs torque-path
   inputs (pedal, torque request) that are not modelled;
-- the crank model does not synchronise above about 1200 rpm (state 4,
-  N = 0 at 1500 rpm; 800 and 1200 rpm are fine), so the monitor's speed
-  never passes 1632 rpm. That is a `Crank` bug to fix first.
+- started straight at 1300-1400 rpm the crank does not synchronise
+  (gap reported, never answered). Not a `Crank` bug: at "gap found"
+  `crank_handler` compares the cam levels with the ones its segment table
+  expects and restarts the search on a mismatch (`0x18154` →
+  `crank_set_mode(0, 0)`); with no cam model the outcome depends on the
+  phase. Synchronised at idle first, the speed then holds anywhere up to
+  7000 rpm, so `Reactions.scenario` now ramps from 800 rpm. Ramped to
+  3000 rpm the monitor sees 2976 rpm (above its 1632), but with `N_max`
+  forced to 1000 the cut mask still stays clear and `n_max_limiter`'s
+  outputs hardly change: its intervention is a torque reduction that the
+  unmodelled pedal and torque request (fault 73, pedal signal) leave with
+  nothing to reduce.
 
-With both, a test would replay the old hook above 1632 rpm and expect
-r13-0x3D97 and the reset record to be set, which is the regression test
-for any limiter-side protection.
+With pedal and torque request modelled, a test would replay the old hook
+above 1632 rpm and expect r13-0x3D97 and the reset record to be set,
+which is the regression test for any limiter-side protection.
 
 ## Next
 
