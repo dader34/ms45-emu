@@ -5,3 +5,5 @@ __pycache__/
 images/*
 !images/README.md
 ms45emu.egg-info/
+.DS_Store
+.claude/
