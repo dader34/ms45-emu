@@ -129,6 +129,51 @@ generated, so `cam_handler` (3.5 KB) never runs and the cam checks
 task10) fail on duration and phase. A cam model needs the microcode
 function D's parameter layout, from `cam_handler`.
 
+## Why the earlier cold-start limiter reset the DME
+
+The first cold-start protection lowered the limiter's own limit: a hook on
+`sth r30,-0x4BD6(r13)` at `0xFFF96950` (`fn_FFF961A0`, task28, the only
+writer of `N_max`) stored a lower value when cold. What the tools show:
+
+- `N_max` itself is read by one routine only, the torque-path limiter
+  `fn_52AD8` (task24 via `fn_68EE8`). Nothing in the safety monitor reads
+  it, so a lower value is not caught by a comparison of the value.
+- The safety monitor (`fn_FFF60788`, task22, 20 sub-monitors, each found
+  by its `*_mon` calibration items) has its own rev-limiter check,
+  `fn_FFF651AC`: with its gate r13-0x3D9F set, its **own** engine speed
+  (r13-0x3D96, from the n_32 monitor `fn_FFF652EC`) above
+  `c_n_max_mtc_lih_thd_mon` (raw 51 = 1632 rpm) and cylinders cut in the
+  cut mask r13-0x6506 (low 6 bits; written by `fn_FFFCB5F0`, applied per
+  cylinder in the segment task's `fn_32688`), it counts up with
+  `c_abc_inc/max_tqi_n_max_mon` and, debounced, sets r13-0x3D97.
+- r13-0x3D97 is read by `fn_FFF64EB0`, which packs the monitor's states
+  into the reset record r13-0x7744..-0x773F (two bytes, each with its
+  complement). At the next start `fn_FFF685F8` checks that record and
+  reports fault 139 `28B2` "Drehzahlbegrenzung: Reset" (XDF
+  `fmy_id_tqi_n_max_nvmy_mon`); fault 137 `28B1` "Drehzahlbegrenzung"
+  (`tqi_n_max_mon_1`) is its running counterpart.
+
+So the chain is: the lowered limit makes the main program cut cylinders
+at a speed the monitor considers legitimate only in limp home; the
+monitor sees a speed-limiter cut it did not expect, confirms it, records
+the rev-limiter reaction in non-volatile memory and resets. The spark-cut
+patch now in `protect.py` avoids exactly that: `N_max` and the cut mask
+stay as stock computes them and only the ignition is withheld, which this
+monitor does not watch.
+
+On the emulator the trip does **not** reproduce yet, and the harness says
+nothing different from stock with `N_max` forced to 500, 1000 or 3500:
+
+- the cut mask stays 0: `fn_52AD8`'s cut decision needs torque-path
+  inputs (pedal, torque request) that are not modelled;
+- the crank model does not synchronise above about 1200 rpm (state 4,
+  N = 0 at 1500 rpm; 800 and 1200 rpm are fine), so the monitor's speed
+  never passes 1632 rpm. That is a `Crank` bug to fix first.
+
+With both, a test would replay the old hook above 1632 rpm and expect
+r13-0x3D97 and the reset record to be set, which is the regression test
+for any limiter-side protection.
+
 ## Next
 
 1. The output-stage IC's protocol on PCS0 (above), so that its self-test
