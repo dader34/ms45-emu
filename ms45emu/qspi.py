@@ -11,12 +11,12 @@ Chip selects seen in the boot's command RAM (docs/protections.md): PCS1
 (code 0xD) is the serial EEPROM (`03 00 00` = READ address 0 is the first
 transfer); PCS3 (0x7, queues 8-12, single bytes) is the knock-sensor IC,
 whose self-test (fault `286A`) wants every byte it was sent echoed back
-in the same transfer. PCS0 (0xE, queues 13-20, 8-byte frames), PCS2
-(0xB, queues 0-3, 16-bit pairs) and the entries with no chip select
-(0xF, queues 21-26) belong to the output-stage IC's traffic; its
-self-test (fault `286B`) wants `AA` in one answer slot, and answering
-`AA` on any of them does not satisfy it (docs/protections.md), so they
-answer as an open bus until the sequence driver is understood.
+in the same transfer. PCS0 (0xE, queues 13-20, 8-byte frames with an XOR
+check byte) is the monitoring module's question/answer channel (MO3,
+docs/protections.md); PCS2 (0xB, queues 0-3, 16-bit pairs) is driven by
+the sequence driver whose self-test is the output-stage IC's (fault
+`286B`); the entries with no chip select (0xF, queues 21-26) come from
+task24. All three answer as an open bus until modelled.
 """
 import struct
 

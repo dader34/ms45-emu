@@ -179,6 +179,40 @@ nothing different from stock with `N_max` forced to 500, 1000 or 3500:
   unmodelled pedal and torque request (fault 73, pedal signal) leave with
   nothing to reduce.
 
+**Correction (2026-10-08): the car stored no fault code, only the reset
+symptoms.** So the fault-memory chain above (28B2) is not what happened.
+A reset with nothing stored comes from outside the main program: the
+monitoring module ("level 3", MO3) on the SPI. The facts:
+
+- PCS0 (queues 13-20) is the monitoring module, not the output-stage IC.
+  `fn_FFF60974` (task22) runs `fn_FFF76F80`, which computes the answer
+  from the level-2 safety monitor's results (it reads the result byte
+  r13-0x3C3A that `safety_monitor`'s sub-monitors build up, and the
+  calibration table `val_mo3_ans_cpm_tab`, XDF: "assignment table for
+  answer of copy of process monitoring", 12 questions), and then
+  `fn_2A2B0` sends the 8-byte frame: bytes r13-0x3C4C..-0x3C46 and their
+  XOR (`3b3b0208ff0000f5` checks: 3b^3b^02^08^ff^00^00 = f5). Byte 1 is
+  the message (`12`, `3B`, `AD`, `CF`). `fn_2A3AC` reads the module's
+  side from the receive RAM.
+- The sub-monitors keep a program-flow signature as they run
+  (`monitor_n_max` adds 5 to r13-0x3C36 on entry and doubles it on exit;
+  `safety_monitor` compares it with 0xD0, 0xBE, 3, … and folds the
+  outcome into r13-0x3C3A). The answer to the module depends on that.
+- The module expects the right answer in time; a wrong or missing one
+  makes it reset the DME (and switch the output stages off) by hardware,
+  which the main program never records.
+- On the emulator the module is not there: the DME sends two frames
+  after boot and then waits for an answer that never comes (receive RAM
+  reads `FF`), so nothing past that is exercised.
+
+Most likely, then, the cold hook changed what the level-2 monitor
+computed (a lower `N_max` than the copy of the limiter in the monitor
+expects, or a different path through `monitor_n_max`), its answers to
+the module stopped matching, and the module reset the DME. Not proved
+yet: proving it needs the module's side of the dialog modelled, after
+which the harness can compare a custom pair's answers with stock's for
+the same questions, the check that matters most for any patch.
+
 With pedal and torque request modelled, a test would replay the old hook
 above 1632 rpm and expect r13-0x3D97 and the reset record to be set,
 which is the regression test for any limiter-side protection.
