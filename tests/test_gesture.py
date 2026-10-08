@@ -4,15 +4,29 @@ from ms45emu import dme
 CALLS_PER_SECOND = 100
 
 
-def _power_up(m):
+def _power_up(m, stored=None):
+    """Ignition on: the stored-data layer initialises block 56, or restores it
+    when the EEPROM holds a byte (every start after the first save)."""
     m.clear_ram()
     init, restore, save = dme.nv_routines(m)
-    m.call(init)
+    if stored is None:
+        m.call(init)
+    else:
+        m.write8(0x3F0100, stored)
+        m.call(restore, 0x3F0100)
     return init, restore, save
 
 
-def test_power_up_indication_then_silence(patched):
+def test_blank_eeprom_shows_nothing(patched):
+    # Until the first save there is no stored byte: the block is initialised and the tach is left alone.
     _power_up(patched)
+    g = dme.Gesture(patched)
+    assert all(g.tick(rpm_in=0) == 0 for _ in range(4 * CALLS_PER_SECOND))
+    assert g.map == 0
+
+
+def test_power_up_indication_then_silence(patched):
+    _power_up(patched, stored=0)
     g = dme.Gesture(patched)
     shown = [g.tick(rpm_in=0) for _ in range(5 * CALLS_PER_SECOND)]
     on = [i for i, v in enumerate(shown) if v > 0]
@@ -70,15 +84,27 @@ def test_running_engine_passes_the_real_rpm_through(patched):
 
 def test_selection_survives_save_and_restore(patched):
     init, restore, save = _power_up(patched)
-    patched.write8(dme.RAM_FLAG, 1)
+    dme.select(patched, 1)
     patched.set_sda8(dme.NV_VAR, 2)                          # the stock variable keeps its value
 
     buf = 0x3F0100
     patched.call(save, buf)
-    assert patched.read8(buf) == 0x82
+    assert patched.read8(buf) == (1 << dme.NV_INDEX_SHIFT) | 2
 
     patched.clear_ram()
-    patched.write8(buf, 0x82)
+    patched.write8(buf, (1 << dme.NV_INDEX_SHIFT) | 2)
     patched.call(restore, buf)
-    assert patched.read8(dme.RAM_FLAG) == 1
+    assert dme.selected(patched) == 1
     assert patched.sda8(dme.NV_VAR) == 2
+    assert patched.reg(2) == dme.map_r2(patched, 1)          # single values now come from map 2
+
+
+def test_restore_of_a_map_this_build_does_not_have_is_map_1(patched):
+    # An earlier build's byte, or one from a build with more maps.
+    init, restore, save = _power_up(patched)
+    buf = 0x3F0100
+    patched.write8(buf, (5 << dme.NV_INDEX_SHIFT) | 1)
+    patched.call(restore, buf)
+    assert dme.selected(patched) == 0
+    assert patched.sda8(dme.NV_VAR) == 1
+    assert patched.reg(2) == dme.map_r2(patched, 0)

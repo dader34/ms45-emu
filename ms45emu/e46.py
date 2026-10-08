@@ -19,7 +19,19 @@ EGS1, EGS2, EGS3 = 0x43F, 0x43B, 0x43D
 
 PERIOD_MS = {ASC1: 10, ASC3: 10, ASC4: 10, STEERING: 10, KOMBI1: 200, KOMBI2: 200, EGS1: 10, EGS2: 10, EGS3: 10}
 
-FRAME_INSTRUCTIONS = 400_000           # 10 ms
+FRAME_INSTRUCTIONS = 400_000           # 10 ms at the default 40 MIPS
+
+
+# The program symbol the gearbox sends for the cluster, in the top three bits of EGS1 byte 2.
+PROGRAM_MANUAL, PROGRAM_SPORT, PROGRAM_DRIVE = 1, 2, 5
+PROGRAM_DRIVE_GEAR_DISPLAY = 4          # D as the GS20 gear-display program sends it
+GEAR_PARK_NEUTRAL, GEAR_REVERSE = 0, 7
+
+
+def egs1(gear, program, lever=5):
+    """An EGS1 frame as the GS20 builds it: the gear (0 in P and N, 1-5, 7 in R),
+    the cluster's lever symbol, the program symbol above five bits of torque data."""
+    return bytes([gear & 7, lever & 0xF, (program & 7) << 5 | 0x0B, 0, 0, 0, 0, 0])
 
 
 def rpm_of(frame):
@@ -46,10 +58,11 @@ class Peers:
     def run(self, instructions):
         """Run the board, feeding the frames that fall due on the way."""
         b = self.board
+        frame = b.ips // 100
         end = b.instructions + instructions
         while b.instructions < end:
             for ident, period in PERIOD_MS.items():
                 if ident in self.data and b.instructions >= self._due[ident]:
                     b.can_a.receive(ident, self.data[ident])
-                    self._due[ident] = b.instructions + period * FRAME_INSTRUCTIONS // 10
-            b.run(min(FRAME_INSTRUCTIONS, end - b.instructions))
+                    self._due[ident] = b.instructions + period * frame // 10
+            b.run(min(frame, end - b.instructions))

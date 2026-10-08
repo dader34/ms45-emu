@@ -24,15 +24,16 @@ TDRE, TC, RDRF, RAF, IDLE, OR = 0x100, 0x80, 0x40, 0x20, 0x10, 0x08
 CLOCK = 40_000_000
 
 
-def byte_instructions(scbr):
+def byte_seconds(scbr):
     """One 11-bit frame at the programmed rate: baud = clock / (32 * SCBR)."""
-    return 11 * 32 * max(scbr & 0x1FFF, 1)
+    return 11 * 32 * max(scbr & 0x1FFF, 1) / CLOCK
 
 
 class Sci:
-    def __init__(self, page, now):
+    def __init__(self, page, now, ips=CLOCK):
         self.p = page
-        self.now = now
+        self.now = now                    # instruction counter
+        self.ips = ips                    # instructions per second of DME time
         self.rx_queue = []                # bytes from the tester, not yet presented
         self.rx_next_at = 0
         self.tx = bytearray()
@@ -83,12 +84,16 @@ class Sci:
             return
         sr = self.p.peek16(SC1SR)
         if sr & RDRF:
-            sr |= OR                       # the program was too slow: overrun
+            # The program has not taken the last byte yet. On the wire that
+            # would be an overrun; here it only means the emulated CPU is
+            # slower than the real one (Board(mips=10) at 115200 baud), so
+            # the line waits for it.
+            return
         b = self.rx_queue.pop(0)
         parity = bin(b).count("1") & 1
         self._rdr = b | (parity << 8)
         self.p.poke16(SC1SR, sr | RDRF)
-        self.rx_next_at = self.now() + byte_instructions(self.p.peek16(SCC1R0))
+        self.rx_next_at = self.now() + int(byte_seconds(self.p.peek16(SCC1R0)) * self.ips)
 
     def interrupt_level(self):
         sr = self.p.peek16(SC1SR)

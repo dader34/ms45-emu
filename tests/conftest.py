@@ -17,3 +17,18 @@ def stock():
 @pytest.fixture
 def patched():
     return Machine(_pair("patched"))
+
+
+@pytest.fixture
+def shifter():
+    return Machine(_pair("shifter"))
+
+
+@pytest.fixture
+def three():
+    return Machine(_pair("three"))
+
+
+@pytest.fixture
+def seven():
+    return Machine(_pair("seven"))

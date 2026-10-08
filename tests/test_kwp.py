@@ -1,10 +1,5 @@
-"""The DME's diagnostic side: KWP2000* over the K line, up to flashing.
-
-The transport, identification, the RSA authentication and the switch into
-programming mode all run against the real firmware. The flash erase/program
-itself is gated behind the DME's flash-enable hardware handshake (a Vpp/WE
-port latch, a multi-flag init sequence) that the board does not model yet,
-so those jobs are not asserted here; see docs/flashing.md.
+"""The DME's diagnostic side: KWP2000* over the K line, up to programming
+mode. Flashing from there is in test_flash.py.
 """
 from ms45emu.board import Board
 from ms45emu.kwp import Tester

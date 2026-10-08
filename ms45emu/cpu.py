@@ -45,6 +45,10 @@ def find_rfi(image, base):
 
 SPR_TBL_R, SPR_TBU_R, SPR_TBL_W, SPR_TBU_W = 268, 269, 284, 285
 SPR_DEC = 22
+SPR_BBCMCR = 560
+BBCMCR_ETRE = 0x1000           # exception table relocation: the compressed table at 0
+BOOT_SIZE = 0x40000            # the boot loader's part of the external flash
+PROGRAM_START = 0x60000        # the program's; the calibration lies between and is data
 
 
 def find_trap_sites(image, base):
@@ -53,8 +57,10 @@ def find_trap_sites(image, base):
     (`mftb`, `mfspr/mtspr TBL/TBU`: the time base reads zero and cannot be
     written). Returns addr -> ("msr", spr) | ("tb_read", reg, spr) | ("tb_write", reg, spr)."""
     out = {}
+    prev = 0
     for off in range(0, len(image) - 3, 4):
-        w = struct.unpack(">I", image[off:off + 4])[0]
+        before, prev = prev, struct.unpack(">I", image[off:off + 4])[0]
+        w = prev
         if w >> 26 != 31:
             continue
         xo = (w >> 1) & 0x3FF
@@ -63,6 +69,14 @@ def find_trap_sites(image, base):
         addr = (base + off) & 0xFFFFFFFF
         if xo == 467 and spr in (SPR_EIE, SPR_EID, SPR_NRI):
             out[addr] = ("msr", spr)
+        elif xo == 467 and spr == SPR_BBCMCR:
+            # Only the `li rX, value; mtspr BBCMCR, rX` sites, which are
+            # the ones that switch the exception table (loader entry: 0,
+            # program start: ETRE). The read-modify-write ones only touch
+            # the burst bit and sit in routines that run from RAM copies,
+            # where an `sc` would not be recognised.
+            if before >> 26 == 14 and (before >> 16) & 31 == 0 and (before >> 21) & 31 == reg:
+                out[addr] = ("bbcmcr", before & 0xFFFF)
         elif xo == 339 and spr == SPR_DEC:
             out[addr] = ("dec_read", reg)
         elif xo == 467 and spr == SPR_DEC:
@@ -92,21 +106,41 @@ def _rlwinm(ra, rs, sh, mb, me):
     return (21 << 26) | (rs << 21) | (ra << 16) | (sh << 11) | (mb << 6) | (me << 1)
 
 
+def code_images(pair, program=True):
+    """(base address, bytes) of the parts of a pair that hold code: the
+    boot loader always, the program (internal flash and the external
+    flash above the calibration) when asked for."""
+    images = [(0xFFF00000, pair.flash[:BOOT_SIZE])]
+    if program:
+        images += [(0, pair.mpc), (0xFFF00000 + PROGRAM_START, pair.flash[PROGRAM_START:])]
+    return images
+
+
 class Cpu:
-    def __init__(self, m):
+    def __init__(self, m, program=True):
+        """program=False leaves the program as it is in the flash and only
+        prepares the boot loader: for a DME whose program the loader will
+        not start (erased, half written, signature not checked yet), where
+        the loader's checksums and signature checks must see the real
+        bytes."""
         self.m = m
+        self.program = program
         self.tb = 0
         self.dec = 0                 # the decrementer, kept here: its sites are trapped
+        self.bbcmcr = 0
         self._build_stubs()
         # MPC5xx EIE/EID/NRI are no-ops under Unicorn. Every such site is
         # replaced in the loaded image by `sc`, whose exception hook applies
         # the MSR change; this costs nothing on other instructions, unlike
         # code hooks. The program's checksums are then recomputed over the
         # patched image, see checksums.py.
-        self.trap_sites = find_trap_sites(m.pair.mpc, 0)
-        self.trap_sites.update(find_trap_sites(m.pair.flash, 0xFFF00000))
+        self.images = code_images(m.pair, program)
+        self.trap_sites = {}
+        self.rfi_sites = set()
+        for base, image in self.images:
+            self.trap_sites.update(find_trap_sites(image, base))
+            self.rfi_sites |= find_rfi(image, base)
         self.msr_sprs = {a: v[1] for a, v in self.trap_sites.items() if v[0] == "msr"}
-        self.rfi_sites = find_rfi(m.pair.mpc, 0) | find_rfi(m.pair.flash, 0xFFF00000)
         self.sc_sites = {}                    # pc after the sc -> site description
         self._patch_trap_sites()
 
@@ -126,10 +160,11 @@ class Cpu:
                 else:
                     m.write32(at, SC)
                     self.sc_sites[(at + 4) & 0xFFFFFFFF] = site
-        self.siu_window_sites, self.sipend_store_sites = relocate_siu_window(m, self.sc_sites)
-        self.msr_const_sites = clear_relocation_bits(m)
-        from .checksums import refresh_program_sums
-        refresh_program_sums(m)
+        self.siu_window_sites, self.sipend_store_sites = relocate_siu_window(m, self.sc_sites, self.images)
+        self.msr_const_sites = clear_relocation_bits(m, self.images)
+        if self.program:
+            from .checksums import refresh_program_sums
+            refresh_program_sums(m)
 
     def _msr_stub(self, spr, back):
         """mtspr SPRG0,r3; mfmsr r3; <edit>; mtmsr r3; mfspr r3,SPRG0; ba back.
@@ -153,6 +188,9 @@ class Cpu:
         """Emulate a trapped instruction. Returns the spr for an MSR site."""
         kind = site[0]
         if kind == "nop":
+            return None
+        if kind == "bbcmcr":
+            self.bbcmcr = site[1]
             return None
         if kind == "msr":
             self.apply_msr_spr_value(site[1])
@@ -221,7 +259,9 @@ class Cpu:
                 stub = SCRATCH + 0x20 * i
                 i += 1
                 ba = m.read32(0xFFF00000 + vector * 0x100 if ip else vector * VECTOR_STRIDE)
-                assert ba >> 26 == 18 and ba & 2, f"vector {vector}: not a ba"
+                if not (ba >> 26 == 18 and ba & 2):
+                    assert not ip, f"vector {vector}: not a ba"
+                    continue                # no program in the internal flash
                 m.write(stub, _asm([
                     0x7C7A03A6,             # mtspr SRR0, r3
                     0x7C9B03A6,             # mtspr SRR1, r4
@@ -290,7 +330,12 @@ class Cpu:
         m.set_reg(3, pc)
         m.set_reg(4, msr)
         mu.reg_write(UC_PPC_REG_MSR, msr & ~MSR_EE)
-        stub = self.raise_stubs[(vector, 1 if msr & MSR_IP else 0)]
+        # The loader runs with MSR[IP] and takes its exceptions at
+        # 0xFFF00000. The program is started with IP still set but turns on
+        # the exception table relocation (BBCMCR[ETRE]), which sends them
+        # to the compressed table at 0 whatever IP says.
+        loader = msr & MSR_IP and not self.bbcmcr & BBCMCR_ETRE
+        stub = self.raise_stubs[(vector, 1 if loader else 0)]
         mu.reg_write(UC_PPC_REG_PC, stub)
         return stub
 
@@ -361,30 +406,33 @@ def find_siu_window_sites(image, base):
     return sites, sipend_stores
 
 
-def relocate_siu_window(m, sc_sites):
+def relocate_siu_window(m, sc_sites, images):
     """Patch the `lis rX, 0x30` sites so the window lives at SIU_SHADOW,
     and make the program's SIPEND stores `sc` no-ops (they clear edge
     requests on hardware; in RAM they would stick)."""
-    a1, s1 = find_siu_window_sites(m.pair.mpc, 0)
-    a2, s2 = find_siu_window_sites(m.pair.flash, 0xFFF00000)
+    sites, stores = [], []
+    for base, image in images:
+        a, st = find_siu_window_sites(image, base)
+        sites += a
+        stores += st
     m.mu.mem_map(SIU_SHADOW_PAGE, 0x1000)
-    for at in a1 + a2:
+    for at in sites:
         for a in ([at, at - 0x100000] if at >= 0xFFF00000 else [at]):
             w = m.read32(a)
             m.write32(a, (w & 0xFFFF0000) | SIU_SHADOW_LIS)
-    for at in s1 + s2:
+    for at in stores:
         for a in ([at, at - 0x100000] if at >= 0xFFF00000 else [at]):
             m.write32(a, SC)
             sc_sites[(a + 4) & 0xFFFFFFFF] = ("nop",)
-    return a1 + a2, s1 + s2
+    return sites, stores
 
 
-def clear_relocation_bits(m):
+def clear_relocation_bits(m, images):
     """`li rX, imm; mtmsr rX` with IR/DR in imm: the MPC555 has no MMU and
     ignores them, Unicorn's core would start translating. Clear them in
     the constant."""
     sites = []
-    for base, buf in ((0, m.pair.mpc), (0xFFF00000, m.pair.flash)):
+    for base, buf in images:
         for a in range(0, len(buf) - 4, 4):
             w = struct.unpack(">I", buf[a:a + 4])[0]
             w2 = struct.unpack(">I", buf[a + 4:a + 8])[0]

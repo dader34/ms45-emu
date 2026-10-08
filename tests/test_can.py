@@ -31,11 +31,11 @@ def test_dme_frames_every_10_ms(stock):
     assert all(abs(g - FRAME) <= FRAME // 10 for g in gaps)
 
 
-def test_map_indication_is_on_the_bus(patched):
+def test_the_hooked_rpm_frame_is_on_the_bus(patched):
     b = Board(patched.pair)
     b.boot(max_insns=20_000_000)
     dme1 = [f for f in b.can_a.tx_log if f.id == e46.DME1]
-    assert dme1 and e46.rpm_of(dme1[-1]) == 1000             # map 1 on a blank EEPROM
+    assert dme1 and e46.rpm_of(dme1[-1]) == 0                # map 1 on a blank EEPROM: no indication, the real rpm
 
 
 def test_received_frames_reach_the_application(stock):

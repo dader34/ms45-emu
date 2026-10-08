@@ -33,9 +33,18 @@ class MmioPage:
         off = addr - self.base
         self.data[off:off + size] = (value & ((1 << (8 * size)) - 1)).to_bytes(size, "big")
 
-    def peek8(self, a):  return self.peek(a, 1)
-    def peek16(self, a): return self.peek(a, 2)
-    def peek32(self, a): return self.peek(a, 4)
+    # The board looks at a dozen registers at every slice boundary, so the
+    # fixed sizes index the backing directly instead of slicing it.
+    def peek8(self, a):
+        return self.data[a - self.base]
+
+    def peek16(self, a):
+        d, off = self.data, a - self.base
+        return (d[off] << 8) | d[off + 1]
+
+    def peek32(self, a):
+        d, off = self.data, a - self.base
+        return (d[off] << 24) | (d[off + 1] << 16) | (d[off + 2] << 8) | d[off + 3]
     def poke8(self, a, v):  self.poke(a, v, 1)
     def poke16(self, a, v): self.poke(a, v, 2)
     def poke32(self, a, v): self.poke(a, v, 4)

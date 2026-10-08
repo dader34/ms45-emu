@@ -15,12 +15,13 @@ from unicorn.ppc_const import UC_PPC_REG_MSR, UC_PPC_REG_PC
 from .machine import Machine, MPC_BASE, MPC_MAP, EXT_BASE, EXT_SIZE
 from .periph import MmioPage, write_zero_to_clear
 from .qspi import Qspi
-from .qadc import Qadc, QADC_A, QADC_B, SCAN_INSTRUCTIONS
+from .qadc import Qadc, QADC_A, QADC_B
 from .toucan import TouCan
 from .sci import Sci
-from .cpu import Cpu, VEC_EXTERNAL, VEC_DECREMENTER, VEC_SYSCALL, MSR_FP, SPR_EIE, SIU_SHADOW
+from .cpu import Cpu, VEC_EXTERNAL, VEC_DECREMENTER, VEC_SYSCALL, MSR_FP, MSR_IP, SPR_EIE, SIU_SHADOW, BBCMCR_ETRE
 
 RESET_ENTRY = 0xFFF717B4         # the boot code after the reset vector's setup
+RESET_VECTOR = 0xFFF00100        # the real one, in the boot loader: starts the program only if it is marked valid
 BOOT_IDLE = 0xFFF717FC           # `b .` at the end of the boot sequence
 
 # Peripheral pages (MPC555, IMMR = 0x2F0000).
@@ -34,12 +35,22 @@ TBSCR, TBREF0, TBREF1 = 0x2FC200, 0x2FC204, 0x2FC208
 TB_REFA, TB_REFB, TB_REFAE, TB_REFBE = 0x80, 0x40, 0x08, 0x04
 SWSR_SEQUENCE = (0x556C, 0xAA39)
 SIPEND, SIMASK = 0x2FC010, 0x2FC014
+# Periodic interrupt timer. The boot loader's main loop (programming mode)
+# has no OS: it polls PISCR[PS] for its 1 ms tick. PITC = 999 there, so the
+# PIT counts at 1 MHz (the 4 MHz crystal / 4).
+PISCR, PITC = 0x2FC240, 0x2FC244
+PLPRCR, PLL_LOCKED = 0x2FC284, 0x00010000
+PIT_PS, PIT_PIE, PIT_PTE = 0x80, 0x04, 0x01
+PIT_HZ = 1_000_000
 BR0, OR0 = 0x2FC100, 0x2FC104
 
 TPU_HSRR = [0x304018, 0x30401A, 0x304418, 0x30441A]    # TPU A (0x304000), B (0x304400): HSRR1, HSRR0
 TPU_CISR = [0x304020, 0x304420]
 TPU_CIER = [0x30400A, 0x30440A]
 
+MPIOSMDR, MPIOSMDDR = 0x306100, 0x306102      # MIOS parallel port: data, direction
+FLASH_ENABLE_PIN = 0x0040
+MMCSM22_COUNTER = 0x3060B0       # MIOS modulus counter 22: the time base of the MIOS PWM outputs
 MIOS_SR0, MIOS_ER0, MIOS_RPR0 = 0x306C00, 0x306C04, 0x306C06
 MIOS_SR1, MIOS_ER1, MIOS_RPR1 = 0x306C40, 0x306C44, 0x306C46
 SOFT_EVENT_BIT = 0x40            # MIOS1 bank 1 bit 6: the OS's "events posted" interrupt
@@ -49,8 +60,13 @@ PWM2_BIT = 0x0004                # MIOS1 bank 0 bit 2: the OS tick
 # IRQ0=0, LVL0=1, IRQ1=2, LVL1=3, ... LVL7=15.
 LEVEL_TPU, LEVEL_QADC, LEVEL_QSPI, LEVEL_MIOS = 3, 7, 9, 13
 
-INTERRUPT_NEST = 0x3FA0E4        # the program's own EID/EIE nesting counter
+INTERRUPT_NEST = 0x3FA0E4        # the program's own EID/EIE nesting counter (looked up per program, see find_interrupt_nest)
 KL15_CHANNEL = 55                # QADC B: ignition sense
+# What the loader leaves in the external flash once a part is complete and
+# its signature checked: program (0xFFF80, 0xFFFC0), calibration (0x5FF80, 0x5FFC0).
+VALID_MARKS = ((0xFFF80, 0x42902448), (0xFFFC0, 0x42244890), (0x5FF80, 0x48249042), (0x5FFC0, 0x90482442))
+BATTERY_CHANNEL = 50             # QADC B: supply voltage; the loader refuses to flash below 0x218
+BATTERY_OK = 0x320
 KL15_FLAG = 0x3FD853             # the DME's "KL15 on" state byte
 RAM_START, RAM_END = 0x3F8000, 0x400000
 
@@ -58,11 +74,11 @@ RAM_START, RAM_END = 0x3F8000, 0x400000
 # runs every 5 ticks and the 10 ms CAN frame 0x316 every 10, so a tick is
 # 1 ms and the time base runs at 2.5 MHz: the 40 MHz core clock divided by
 # 16. 1 instruction = 1 clock here.
-CLOCKS_PER_TICK = 16
+TB_HZ = 2_500_000                # 16 instructions per unit at the default 40 MIPS
 SLICE = 20_000
 HURRY_SLICE = 256                # while an interrupt waits for the program to allow it
+HURRY_LIMIT = 200                # ... unless it keeps them off (the boot loader never enables them)
 BUSY_SLICE, BUSY_SLICES = 2000, 10   # after interrupt activity, this many short slices
-TICK_INSTRUCTIONS = 400_000      # the OS tick (MIOS PWM2 period), about 10 ms
 
 
 class OpenBus:
@@ -92,10 +108,26 @@ class OpenBus:
 
 
 class Board:
-    def __init__(self, pair):
+    def __init__(self, pair, patch_program=True, mips=40):
+        """patch_program=False prepares only the boot loader for emulation
+        and leaves the program's bytes alone (see Cpu): for a DME that
+        will stay in the loader.
+
+        mips is how many million instructions make a second of the DME's
+        time. 40 counts an instruction as one clock of the 40 MHz CPU. The
+        program keeps its schedule down to 10, where the emulator is faster
+        than real time, which is what a tester on a real clock needs."""
         self.m = Machine(pair, periph_ram=False)
         m = self.m
-        self.cpu = Cpu(m)
+        self.mips = mips
+        self.ips = mips * 1_000_000                       # instructions per second
+        self.clocks_per_tick = self.ips // TB_HZ          # instructions per time base unit
+        self.tick_instructions = self.ips // 100          # the MIOS PWM2 period, 10 ms
+        self.scan_instructions = self.ips // 100          # a periodic ADC scan, 10 ms
+        self.pit_clock_instructions = self.ips // PIT_HZ
+        assert self.clocks_per_tick >= 1 and self.pit_clock_instructions >= 1
+        self.cpu = Cpu(m, program=patch_program)
+        self.interrupt_nest = (self.find_interrupt_nest() if patch_program else None) or (INTERRUPT_NEST if m.pair.traced else None)
         self.bus = OpenBus(m)
 
         self.siu = MmioPage(m, SIU_PAGE, 0x1000)
@@ -122,12 +154,18 @@ class Board:
         for ref, flag in ((TBREF0, TB_REFA), (TBREF1, TB_REFB)):
             self.siu.on_write(ref, lambda a, size, value, flag=flag: self._tbref_write(size, value, flag))
         self.siu.on_read(SIPEND, lambda a, s: self.pending_external())   # for sites not relocated
+        # The reset path waits for the PLL to report lock before it sets the clocks.
+        self.siu.on_read(PLPRCR, lambda a, s: self.siu.peek32(PLPRCR) | PLL_LOCKED if s == 4 else None)
+        self.pit_expiries = 0
+        self._next_pit = None
+        self.siu.on_write(PISCR, self._piscr_write)
 
         # TPU: host service requests are acknowledged at once; CISR is write-0-to-clear
-        from .tpu import Tpu
+        from .tpu import Tpu, Crank
         self.tpu_a = Tpu(self.imb, 0x304000, "A")
         self.tpu_b = Tpu(self.imb, 0x304400, "B")
         self.tpu_requests = 0
+        self.crank = Crank(self)
         for reg in TPU_HSRR:
             self.imb.on_write(reg, self._hsrr_write)
             self.imb.on_read(reg, lambda a, s: 0)
@@ -135,25 +173,38 @@ class Board:
             write_zero_to_clear(self.imb, reg)
 
         # QSPI with the EEPROM, ADCs
-        self.qspi = Qspi(self.imb)
-        self.adc_a = Qadc(self.imb, QADC_A, "A", lambda: self.instructions)
-        self.adc_b = Qadc(self.imb, QADC_B, "B", lambda: self.instructions)
+        self.qspi = Qspi(self.imb, lambda: self.instructions, self.ips)
+        self.adc_a = Qadc(self.imb, QADC_A, "A", lambda: self.instructions, self.ips)
+        self.adc_b = Qadc(self.imb, QADC_B, "B", lambda: self.instructions, self.ips)
         self.ignition(True)
+        self.adc_b.channels[BATTERY_CHANNEL] = BATTERY_OK
 
         # CAN: A is the vehicle bus, B the second module
         self.canp = MmioPage(m, CAN_PAGE, 0x1000)
         self.can_a = TouCan(self.canp, CAN_PAGE + 0x80, "A", lambda: self.instructions)
         self.can_b = TouCan(self.canp, CAN_PAGE + 0x480, "B", lambda: self.instructions)
         # K-line
-        self.sci = Sci(self.imb, lambda: self.instructions)
+        self.sci = Sci(self.imb, lambda: self.instructions, self.ips)
         # The flash is read-only to the program; writes are commands to the
         # chips (or stray) and go to the flash models through the hook.
         m.mu.mem_protect(MPC_BASE, MPC_MAP, UC_PROT_READ | UC_PROT_EXEC)
         m.mu.mem_protect(EXT_BASE, EXT_SIZE, UC_PROT_READ | UC_PROT_EXEC)
         self.flash_writes = []
         from .flashchip import FlashChip
+        from .cmf import Cmf
         self.flash = FlashChip(m)
+        # The internal flash only takes program/erase with its EPEE pin
+        # high. The loader's flash-init raises MPIO pin 6 (0x306100 bit
+        # 0x40) before anything else and the reset path never touches it,
+        # so that pin is taken to be the enable.
+        self.cmf = Cmf(m, self.siu, lambda: bool(self.mios.peek16(MPIOSMDR) & self.mios.peek16(MPIOSMDDR) & FLASH_ENABLE_PIN))
         m.mu.hook_add(UC_HOOK_MEM_WRITE_PROT, self._flash_write)
+        # A dump read over diagnostics comes without the loader's "valid"
+        # marks. A DME that runs its program has them, so put them back.
+        if patch_program:
+            for at, mark in VALID_MARKS:
+                if self.flash.image[at:at + 4] == b"\xff\xff\xff\xff":
+                    self.flash.store(at, mark.to_bytes(4, "big"))
 
         # MIOS interrupts: status registers write-0-to-clear, request = status & enable,
         # bank-1 bit 6 always asserted (the OS's software interrupt).
@@ -164,18 +215,25 @@ class Board:
         self.mios.on_read(MIOS_RPR1, lambda a, s: (self.mios.peek16(MIOS_SR1) | SOFT_EVENT_BIT) & self.mios.peek16(MIOS_ER1))
         self.events_posted = 0
         self.mios.on_write(MIOS_ER1, self._er1_write)
+        # The PWM duty update (0x1B538, used once the engine runs) waits
+        # for this counter to be clear of the old pulse width before it
+        # writes the new one, so it has to count. Each read moves it on as
+        # well: the instruction count only advances between slices.
+        self._counter_reads = 0
+        self.mios.on_read(MMCSM22_COUNTER, self._mmcsm_read)
 
         # interrupt bookkeeping
         self.interrupts_taken = Counter()
         self.dec_exceptions = 0
         self.dec_pending = False
         self._hurry = False
+        self._hurried = 0
         self._busy = 0
         self.fp_enables = 0
         self.instructions = 0
         self.ticks = 0
-        self._next_tick = TICK_INSTRUCTIONS
-        self._next_scan = SCAN_INSTRUCTIONS
+        self._next_tick = self.tick_instructions
+        self._next_scan = self.scan_instructions
 
         # The only hook on the instruction stream: the exception raised by
         # the `sc` that replaced each EIE/EID/NRI, and any real `sc`.
@@ -226,10 +284,12 @@ class Board:
     def _flash_write(self, mu, access, addr, size, value, ud):
         if len(self.flash_writes) < 10000:
             self.flash_writes.append((addr, size, value, self.m.pc))
-        # External flash (and its programming-mode window): a command to the
-        # chip. The internal MPC flash has no command set and is left dropped.
+        # External flash: a command to the chip. Internal flash: program
+        # data or the erase interlock for the CMF.
         if any(base <= addr < base + self.flash.size for base in self.flash.windows):
             self.flash.write(addr, size, value)
+        elif addr < self.cmf.size:
+            self.cmf.array_write(addr, size, value)
         return True                                   # the raw store is still dropped
 
     # ---- register handlers -----------------------------------------------
@@ -239,6 +299,22 @@ class Board:
             if 0 < behind < 0x80000000:
                 self.tb_late_refs += 1
         return None
+
+    def _piscr_write(self, addr, size, value):
+        if size != 2:
+            return None
+        old = self.siu.peek16(PISCR)
+        # The application leaves PITC at 0 and never looks at PS; only a
+        # real period is worth cutting slices for.
+        if value & PIT_PTE and self.siu.peek32(PITC) >> 16:
+            if self._next_pit is None:
+                self._next_pit = self.instructions + self._pit_period()
+        else:
+            self._next_pit = None
+        return (old & PIT_PS & ~value) | (value & ~PIT_PS)       # PS is write-1-to-clear
+
+    def _pit_period(self):
+        return ((self.siu.peek32(PITC) >> 16) + 1) * self.pit_clock_instructions
 
     def _swsr_write(self, addr, size, value):
         if value == SWSR_SEQUENCE[self._wd_expect]:
@@ -264,8 +340,14 @@ class Board:
                     ch = first + i
                     w7 = tpu + 0x100 + ch * 16 + 0xE
                     self.imb.poke16(w7, self.imb.peek16(w7) | 0x2000)
-                    (self.tpu_a if tpu == 0x304000 else self.tpu_b).on_service(ch, self.instructions)
+                    (self.tpu_a if tpu == 0x304000 else self.tpu_b).on_service(ch, self.instructions, (value >> (2 * i)) & 3)
         return 0                                  # serviced before it can be read back
+
+    def _mmcsm_read(self, addr, size):
+        if size != 2:
+            return None
+        self._counter_reads += 1
+        return (self.instructions // self.clocks_per_tick + self._counter_reads) & 0xFFFF
 
     def _er1_write(self, addr, size, value):
         if value & SOFT_EVENT_BIT and not (self.mios.peek16(MIOS_ER1) & SOFT_EVENT_BIT):
@@ -315,7 +397,33 @@ class Board:
         # them.
         if self.cpu.in_stub(self.m.pc):
             return False
-        return self.cpu.interrupts_enabled() and self.m.read32(INTERRUPT_NEST) == 0
+        nest = self.interrupt_nest
+        return self.cpu.interrupts_enabled() and (nest is None or self.m.read32(nest) == 0)
+
+    def find_interrupt_nest(self):
+        """The address of the program's interrupt nesting counter, or None.
+
+        Its critical sections are `mtspr EID` followed at once by a load
+        and a store of the counter, r13-relative: the word most of the
+        program's EID sites touch right after is the counter. Found by
+        looking rather than known by address, so that another program of
+        the family runs as well (it turns out to keep it in the same place)."""
+        from collections import Counter
+        from .cpu import SPR_EID
+        from .machine import R13
+        touched = Counter()
+        for addr, site in self.cpu.trap_sites.items():
+            if site[0] != "msr" or site[1] != SPR_EID:
+                continue
+            for k in (1, 2, 3):
+                w = self.m.read32(addr + 4 * k)
+                if w >> 26 in (32, 36) and (w >> 16) & 31 == 13:          # lwz / stw rX, d(r13)
+                    d = w & 0xFFFF
+                    touched[(R13 + (d - 0x10000 if d & 0x8000 else d)) & 0xFFFFFFFF] += 1
+        if not touched:
+            return None
+        addr, count = touched.most_common(1)[0]
+        return addr if count >= 50 else None
 
     def _deliver(self):
         """Raise the highest pending interrupt if the CPU will take it.
@@ -368,7 +476,7 @@ class Board:
 
     # ---- time ---------------------------------------------------------------
     def _advance_clocks(self, instructions):
-        ticks = instructions // CLOCKS_PER_TICK
+        ticks = instructions // self.clocks_per_tick
         self.cpu.tb += ticks
         dec = self.cpu.read_dec()
         new = (dec - ticks) & 0xFFFFFFFF
@@ -388,8 +496,8 @@ class Board:
         # (QSPI transfer -> event -> next transfer), so stay fine-grained for
         # a while; otherwise take long slices.
         n = HURRY_SLICE if self._hurry else (BUSY_SLICE if self._busy else SLICE)
-        if dec < 0x80000000 and dec * CLOCKS_PER_TICK < n:
-            n = dec * CLOCKS_PER_TICK + CLOCKS_PER_TICK
+        if dec < 0x80000000 and dec * self.clocks_per_tick < n:
+            n = dec * self.clocks_per_tick + self.clocks_per_tick
         # Likewise the time base reference compares, so their status bit is
         # set at the right instruction rather than at the end of a slice.
         tbscr = self.siu.peek16(TBSCR)
@@ -398,8 +506,21 @@ class Board:
             for ref, enable in ((TBREF0, TB_REFAE), (TBREF1, TB_REFBE)):
                 if tbscr & enable:
                     ahead = (self.siu.peek32(ref) - tb) & 0xFFFFFFFF
-                    if ahead * CLOCKS_PER_TICK < n:
-                        n = ahead * CLOCKS_PER_TICK + CLOCKS_PER_TICK
+                    if ahead * self.clocks_per_tick < n:
+                        n = ahead * self.clocks_per_tick + self.clocks_per_tick
+        event = self.crank.next_event()
+        if event is not None:
+            n = min(n, max(int(event) - self.instructions, 0) + self.clocks_per_tick)
+        if self._next_pit is not None:
+            n = min(n, max(self._next_pit - self.instructions, 0) + self.clocks_per_tick)
+        if self.qspi.done_at is not None:
+            n = min(n, max(self.qspi.done_at - self.instructions, 0) + self.clocks_per_tick)
+        # Hand the K line's receiver each byte when the byte is due: the
+        # loader polls for it, and at 115200 baud a byte is shorter than
+        # the slices the program is otherwise run in, so a telegram would
+        # arrive stretched past the DME's inter-byte timeout.
+        if self.sci.rx_queue:
+            n = min(n, max(self.sci.rx_next_at - self.instructions, 0) + self.clocks_per_tick)
         return max(n, 64)
 
     def _slice_boundary(self, ran):
@@ -407,6 +528,8 @@ class Board:
         if self._advance_clocks(ran):
             self.dec_pending = True
         self.sci.service()
+        self.qspi.service()
+        self.crank.service()
         # A software-started ADC scan takes real time, so it completes here.
         self.adc_a.service()
         self.adc_b.service()
@@ -414,30 +537,51 @@ class Board:
             self.adc_a.queue2_started = self.adc_b.queue2_started = False
             self._next_scan = self.instructions          # first scan of a fresh queue is immediate
         if self.instructions >= self._next_scan:
-            self._next_scan += SCAN_INSTRUCTIONS
+            self._next_scan += self.scan_instructions
             self.adc_a.periodic()
             self.adc_b.periodic()
         # Time base reference compare: TB low word passing TBREF0/1.
         tbscr = self.siu.peek16(TBSCR)
         if tbscr & 0x1:                                   # TBE
             tbl = self.cpu.tb & 0xFFFFFFFF
-            prev = (self.cpu.tb - ran // CLOCKS_PER_TICK) & 0xFFFFFFFF
+            prev = (self.cpu.tb - ran // self.clocks_per_tick) & 0xFFFFFFFF
             for ref, flag in ((TBREF0, TB_REFA), (TBREF1, TB_REFB)):
                 r = self.siu.peek32(ref)
                 if (prev < r <= tbl) or (prev > tbl and (r > prev or r <= tbl)):
                     self.siu.poke16(TBSCR, self.siu.peek16(TBSCR) | flag)
                     self.tb_interrupts += 1
+        if self._next_pit is not None and self.instructions >= self._next_pit:
+            self._next_pit += self._pit_period()
+            self.pit_expiries += 1
+            self.siu.poke16(PISCR, self.siu.peek16(PISCR) | PIT_PS)
         if self.instructions >= self._next_tick:
-            self._next_tick += TICK_INSTRUCTIONS
+            self._next_tick += self.tick_instructions
             self.ticks += 1
             if self.mios.peek16(MIOS_ER0) & PWM2_BIT:
                 self.mios.poke16(MIOS_SR0, self.mios.peek16(MIOS_SR0) | PWM2_BIT)
-        delivered = self._deliver()
+        # What _deliver() does, with the device state looked at once: raising
+        # an exception changes none of it, and the CPU is only asked whether
+        # it will take an interrupt when there is one to take.
         pend = self.pending_external()
-        if not delivered:
+        masked = pend & self.m.read32(SIU_SHADOW + 4)
+        delivered = False
+        if (self.dec_pending or masked) and self._can_interrupt():
+            delivered = True
+            if self.dec_pending:
+                self.dec_pending = False
+                self.cpu.raise_exception(VEC_DECREMENTER)
+                self.dec_exceptions += 1
+            else:
+                self.m.write32(SIU_SHADOW, pend)                 # SIPEND, as the prologue reads it
+                self.cpu.raise_exception(VEC_EXTERNAL)
+                self.interrupts_taken[32 - masked.bit_length()] += 1
+        else:
             self.m.write32(SIU_SHADOW, pend)
-        self._hurry = self.dec_pending or bool(pend & self.m.read32(SIU_SHADOW + 4))
+        waiting = self.dec_pending or bool(masked)
+        self._hurried = self._hurried + 1 if (waiting and not delivered) else 0
+        self._hurry = waiting and self._hurried < HURRY_LIMIT
         self._busy = BUSY_SLICES if (delivered or self._hurry) else max(0, self._busy - 1)
+        return delivered
 
     # ---- running ------------------------------------------------------------
     # ---- the car around the DME ----------------------------------------------
@@ -448,13 +592,21 @@ class Board:
 
     @property
     def kl15(self):
-        return bool(self.m.read8(KL15_FLAG))
+        """The DME's own "KL15 on" flag; None for a program its address is not known in."""
+        return bool(self.m.read8(KL15_FLAG)) if self.m.pair.traced else None
 
     @property
     def powered_down(self):
         """After the after-run the DME parks in a loop copied to RAM and
         waits for the main relay to drop."""
         return RAM_START <= self.m.pc < RAM_END
+
+    @property
+    def in_loader(self):
+        """Whether the boot loader has the CPU (programming mode, or
+        nothing valid to start): exceptions at 0xFFF00000, as
+        Cpu.raise_exception tells the two apart."""
+        return bool(self.cpu.msr & MSR_IP) and not self.cpu.bbcmcr & BBCMCR_ETRE
 
     def eeprom_image(self):
         return bytes(self.qspi.eeprom.data)
@@ -466,17 +618,53 @@ class Board:
         """Keep running from where the program is."""
         return self.run_from(self.m.pc, max_insns)
 
-    def boot(self, max_insns=5_000_000, until=BOOT_IDLE):
-        """Run the reset path in slices. Returns (reached_idle, reason)."""
+    def boot(self, max_insns=5_000_000, until=BOOT_IDLE, reset_vector=False):
+        """Run the reset path in slices. Returns (reached_idle, reason).
+
+        By default this starts at the program's own reset entry. With
+        reset_vector it starts where the CPU does, in the boot loader,
+        which starts the program only when both the program and the
+        calibration carry the "signature checked" marks it writes after a
+        flash (dumps read over diagnostics do not include them) and
+        otherwise stays in programming mode.
+
+        The reset entry is one program's (image.PROGRAM_ID); any other is
+        always started from the reset vector, which is in the boot loader
+        and the same for all of them."""
+        if reset_vector or not self.m.pair.traced:
+            self.m.mu.reg_write(UC_PPC_REG_MSR, MSR_IP)
+            return self.run_from(RESET_VECTOR, max_insns, until)
         self.m.mu.reg_write(UC_PPC_REG_MSR, 0)
         return self.run_from(RESET_ENTRY, max_insns, until)
+
+    def flash_pair(self):
+        """What the two flash memories hold now, without the emulator's patches."""
+        from .image import Pair
+        return Pair(bytes(self.flash.image), bytes(self.cmf.image), self.m.pair.name, check_program=False)
+
+    def program_valid(self):
+        """Whether the loader will start the program at the next reset:
+        the marks it writes after its checksum and signature checks of the
+        program and of the calibration are both there."""
+        image = self.flash.image
+        return all(int.from_bytes(image[at:at + 4], "big") == mark for at, mark in VALID_MARKS)
+
+    def reset(self):
+        """The DME after a reset: a new board on the flash contents as
+        they are now, with this one's EEPROM and inputs. Boot it with
+        reset_vector=True to have the loader decide what runs."""
+        b = Board(self.flash_pair(), patch_program=self.program_valid(), mips=self.mips)
+        b.load_eeprom(self.eeprom_image())
+        b.adc_a.channels.update(self.adc_a.channels)
+        b.adc_b.channels.update(self.adc_b.channels)
+        return b
 
     def run_from(self, pc, max_insns, until=BOOT_IDLE):
         done = 0
         while done < max_insns:
             n = self._slice_length()
             try:
-                self.m.run(pc, until, max_insns=n)
+                pc = self.m.run(pc, until, max_insns=n)
             except UcError as e:
                 # The program relies on the FP-unavailable exception to switch
                 # the FPU on; Unicorn stops instead of vectoring, so do it here.
@@ -486,12 +674,11 @@ class Board:
                     pc = self.m.pc
                     continue
                 return False, f"{e} at pc=0x{self.m.pc:X}"
-            pc = self.m.pc
             done += n
             if pc == until:
                 return True, "idle"
-            self._slice_boundary(n)
-            pc = self.m.pc
+            if self._slice_boundary(n):
+                pc = self.m.pc                # an exception was raised: on to its stub
         return False, f"ran out of instructions at pc=0x{self.m.pc:X}"
 
     def report(self):

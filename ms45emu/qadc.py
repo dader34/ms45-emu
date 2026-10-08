@@ -20,16 +20,20 @@ END_OF_QUEUE = 0x3F
 CF1, PF1, CF2, PF2 = 0x8000, 0x4000, 0x2000, 0x1000
 CIE1, SSE1, CIE2 = 0x8000, 0x2000, 0x8000
 
-# A scan of queue 2 every this many emulated instructions (~10 ms), and
-# how long a software-started queue 1 scan takes (~200 us).
-SCAN_INSTRUCTIONS = 400_000
-Q1_SCAN_INSTRUCTIONS = 8_000
+# How long a software-started queue 1 scan takes: 200 us, but never fewer
+# than 8000 instructions. The program restarts the scan from its
+# completion interrupt, so on a slower clock (Board(mips=10)) a scan that
+# only took 200 us of instructions would leave nothing for the interrupt
+# levels below it. (Queue 2 is scanned by the board, every 10 ms.)
+Q1_SCAN_SECONDS = 0.0002
+Q1_SCAN_MIN_INSTRUCTIONS = 8_000
 
 
 class Qadc:
-    def __init__(self, page, base, name, now=lambda: 0):
+    def __init__(self, page, base, name, now=lambda: 0, ips=40_000_000):
         self.p = page
         self.now = now                # instruction counter, for scan timing
+        self.q1_scan_instructions = max(int(Q1_SCAN_SECONDS * ips), Q1_SCAN_MIN_INSTRUCTIONS)
         self.base = base
         self.name = name
         self.channels = {}            # channel -> 10-bit value
@@ -46,7 +50,7 @@ class Qadc:
     def _qacr1_write(self, addr, size, value):
         if size == 2 and value & SSE1 and (value & 0x1F00) and not self.q1_due:
             self.q1_due = True
-            self.q1_done_at = self.now() + Q1_SCAN_INSTRUCTIONS
+            self.q1_done_at = self.now() + self.q1_scan_instructions
         return None
 
     def _qacr2_write(self, addr, size, value):
