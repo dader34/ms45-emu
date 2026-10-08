@@ -7,9 +7,16 @@ and the QSPI interrupt report completion. Each command byte is
 CONT|BITSE|DT|DSCK|PCS3..0; a transaction to a device is the run of
 consecutive entries with CONT set, ended by the entry that clears it.
 
-Chip selects seen in the boot's command RAM: PCS1 (code 0xD) is the serial
-EEPROM (`03 00 00` = READ address 0 is the first transfer); PCS0, PCS2 and
-PCS3 are other devices, answered as an open bus until modelled.
+Chip selects seen in the boot's command RAM (docs/protections.md): PCS1
+(code 0xD) is the serial EEPROM (`03 00 00` = READ address 0 is the first
+transfer); PCS3 (0x7, queues 8-12, single bytes) is the knock-sensor IC,
+whose self-test (fault `286A`) wants every byte it was sent echoed back
+in the same transfer. PCS0 (0xE, queues 13-20, 8-byte frames), PCS2
+(0xB, queues 0-3, 16-bit pairs) and the entries with no chip select
+(0xF, queues 21-26) belong to the output-stage IC's traffic; its
+self-test (fault `286B`) wants `AA` in one answer slot, and answering
+`AA` on any of them does not satisfy it (docs/protections.md), so they
+answer as an open bus until the sequence driver is understood.
 """
 import struct
 
@@ -75,14 +82,40 @@ class OpenDevice:
         return b"\xff" * len(out)
 
 
+class EchoDevice:
+    """Shifts back what it is sent: the knock-sensor IC, as far as the
+    program's self-test of it goes."""
+
+    def transaction(self, out: bytes) -> bytes:
+        return bytes(out)
+
+
+class ConstantDevice:
+    """Answers every byte with the same value (for trying a chip select out)."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def transaction(self, out: bytes) -> bytes:
+        return bytes([self.value]) * len(out)
+
+
+PCS_KNOCK, PCS_EEPROM = 0x7, 0xD
+
+
 class Qspi:
-    def __init__(self, page):
+    def __init__(self, page, now=None, ips=40_000_000):
         self.page = page
         self.devices = {pcs: OpenDevice() for pcs in range(16)}
         self.eeprom = Eeprom25()
-        self.devices[0xD] = self.eeprom           # PCS1 low
+        self.devices[PCS_EEPROM] = self.eeprom           # PCS1 low
+        self.devices[PCS_KNOCK] = EchoDevice()
         self.transfers = 0
         self.log = []
+        self.now = now                            # instruction counter, or None: transfers complete at once
+        self.ips = ips
+        self.done_at = None                       # when the running queue completes (SPIF, interrupt)
+        self._done_spsr = 0
         page.on_write(SPCR1, self._spcr1_write)
 
     def _spcr1_write(self, addr, size, value):
@@ -90,6 +123,19 @@ class Qspi:
             self._transfer()
             return value & ~SPE                   # the queue has run by the time SPE is read back
         return None
+
+    def next_event(self):
+        """When the running queue completes, for the slice to end there."""
+        return self.done_at
+
+    def service(self):
+        """Report completion once the queue's bits have had their time on the
+        wire: SPIF, and with it the interrupt, at the instruction they are
+        due rather than at the write that started the queue, so a slice can
+        run long and still end exactly there."""
+        if self.done_at is not None and self.now() >= self.done_at:
+            self.done_at = None
+            self.page.poke8(SPSR, self._done_spsr)
 
     def _transfer(self):
         p = self.page
@@ -130,7 +176,17 @@ class Qspi:
                 self.log.pop(0)
 
         self.transfers += 1
-        p.poke8(SPSR, SPIF | (endqp & 0x1F))
+        spsr = SPIF | (endqp & 0x1F)
+        if self.now is None:
+            p.poke8(SPSR, spsr)
+            return
+        # the queue's time on the wire: its bits at the SPI clock, 40 MHz
+        # over twice SPBR (SPCR0 bits 7-0), a byte or a word per entry
+        spbr = max(p.peek16(SPCR0) & 0xFF, 1)
+        total_bits = sum(16 if (p.peek8(CMD_RAM + e) & BITSE and wide) else 8 for e in entries)
+        seconds = total_bits * 2 * spbr / 40_000_000
+        self.done_at = self.now() + max(int(seconds * self.ips), 64)
+        self._done_spsr = spsr
 
     def interrupt_pending(self):
         p = self.page

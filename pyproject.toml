@@ -7,9 +7,13 @@ dependencies = ["unicorn>=2.1", "capstone>=5"]
 
 [project.optional-dependencies]
 test = ["pytest"]
+serial = ["pyserial"]        # tools/kline.py --port
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.setuptools]
 packages = ["ms45emu"]
+
+[tool.setuptools.package-data]
+ms45emu = ["names/*.json"]      # the hand-traced routine and variable names per program
