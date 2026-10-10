@@ -58,6 +58,11 @@ holds no main relay and is off at once. Ignition on starts a DME that
 was off from its reset vector, on what its flash holds: the way out of
 a flash that was interrupted, as in the car.
 
+With nothing happening for an hour (no bytes from a tester on any line,
+nothing typed, no ignition command) the bridge quits as `q` would, saving
+the EEPROM and any flash it changed; --idle-timeout sets the seconds, 0
+never.
+
 The DME keeps real time: a tester's timeouts and pauses are in real
 milliseconds, and so are the DME's. For that the emulated CPU is clocked
 at 10 MIPS instead of 40 (--mips), which the program still keeps its
@@ -99,6 +104,7 @@ TURBO_ANSWER_SECONDS = 0.1   # --turbo: DME time to wait for an answer to start 
 TURBO_LIMIT_SECONDS = 2.0    # ... and to wait for one that has started to finish
 AFTER_RUN_LIMIT_SECONDS = 90 # ignition off: DME time the after-run gets before the main relay drops anyway
 PARKED_SLICES = 4            # ... and how many looks in a row have to find the program parked
+IDLE_TIMEOUT_SECONDS = 3600 # quit after this long without a tester or a command (--idle-timeout)
 BAUD_RATES = (9600, 10400, 19200, 38400, 57600, 115200, 125000)
 
 
@@ -750,6 +756,9 @@ def main():
                     help="build the diagnostic patch onto the pair first (ms45emu/diagpatch.py, docs/logging.md)")
     ap.add_argument("--resume", action="store_true",
                     help="start on the flash contents saved at the last exit (<eeprom>.flash.bin / .mpc.bin), from the reset vector")
+    ap.add_argument("--idle-timeout", type=float, default=IDLE_TIMEOUT_SECONDS, metavar="SECONDS",
+                    help=f"quit after this long with no tester bytes, typing or ignition command "
+                         f"(default {IDLE_TIMEOUT_SECONDS}: an hour; 0 never)")
     args = ap.parse_args()
 
     lines = [Port(args.port) if args.port else Pty(args.link)]
@@ -825,6 +834,7 @@ def main():
     ignition = True                    # KL15
     powered = True                     # False once the main relay has dropped: the CPU stands still
     off_at, parked = 0, 0              # DME time of ignition off, and looks in a row that found the program parked
+    active_at = time.time()            # wall time of the latest tester bytes or command (--idle-timeout)
 
     def reset_board(why):
         """A new board on what the flash and the EEPROM hold now, started from the reset vector."""
@@ -885,6 +895,7 @@ def main():
                 if line in r:
                     data = line.read()
                     if data:
+                        active_at = time.time()
                         if getattr(line, "echoes", True):
                             line.write(data)                  # the cable's echo
                         if not powered or wrong_rate(line, dme_baud(board)):
@@ -899,6 +910,8 @@ def main():
                             trace.add("tester", data, board.instructions / board.ips)
             if sys.stdin in r:
                 typed = sys.stdin.readline()
+                if typed:
+                    active_at = time.time()
                 if typed.strip() == "q":
                     break
                 if typed.strip() == "i":
@@ -912,7 +925,12 @@ def main():
                 if hasattr(line, "service"):
                     line.service()
                     while line.commands:
+                        active_at = time.time()
                         set_ignition(line.commands.pop(0))
+            if args.idle_timeout and time.time() - active_at > args.idle_timeout:
+                idle = f"{args.idle_timeout / 60:g} min" if args.idle_timeout >= 60 else f"{args.idle_timeout:g} s"
+                print(f"{stamp()} nothing from a tester for {idle}: quitting", flush=True)
+                break
             if not powered:
                 if trace:
                     trace.idle()
