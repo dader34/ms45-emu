@@ -96,6 +96,30 @@ which is the baseline and a list of what the board does not model yet:
 A reset never happens on the stock pair: the watchdog is serviced 10 ms
 after 10 ms, no exception, no hang.
 
+## Pedal and throttle
+
+`ms45emu/inputs.py` puts the pedal and the throttle pots on the QADC
+channels the program reads (found through its logical-channel reader
+`fn_93B4` and checked: 0 % and 50 % read back exactly, 10 degrees reads
+1372 counts); `Reactions.scenario` sets the pedal released and the
+throttle at the lower stop unless told otherwise. The stock baseline
+loses fault 73 with it, and no pedal or throttle fault fails.
+
+Not modelled: the throttle motor. The program writes its duty to MIOS
+PWM 16 and 19 (period 50000; `fn_1BB28`), but that duty ramps to 0.654
+after start and hardly answers a change of angle, so it is not the
+position loop on its own; the H-bridge is most likely the output-stage
+IC on PCS2 (fault 173), which is not modelled either. The throttle
+therefore stays where the scenario puts it. The setpoint is computed in
+`fn_62600` (the routine reading the `c_tps_sp_*` items).
+
+With the pedal at 40 or 100 % and the throttle at 20 or 80 degrees, the
+old cold hook (N_max forced to 1000 at 3000 rpm) still changes nothing
+on the emulator: r13-0x6506, taken above for the cut mask the limiter
+monitor watches, is only written by `cut_mask_set` at start-up and by
+the engine state manager, so the limiter's own fuel cut must be
+somewhere else and has not been found yet.
+
 ## The ignition checks and the TPU
 
 Faults 53-64 (coils, ignition per cylinder) come from `ignition_diagnosis`

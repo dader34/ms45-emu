@@ -221,11 +221,19 @@ class Reactions:
             if self.hang is not None or b.powered_down:
                 break
 
-    def scenario(self, rpm=0, seconds=1.0, settle=0.5, speed=0, key_off=False, automatic=False):
+    def scenario(self, rpm=0, seconds=1.0, settle=0.5, speed=0, key_off=False, automatic=False, pedal=0.0, throttle=0.0):
         """Boot (settle), then run `seconds` with the E46 peers on the bus,
-        the crank at rpm, and the ignition off when asked."""
+        the crank at rpm, the pedal at `pedal` % and the throttle held at
+        `throttle` degrees (ms45emu/inputs.py; None leaves the channels
+        at mid-scale), and the ignition off when asked."""
         from .e46 import Peers
+        from . import inputs
         b = self.board
+        if b.m.pair.traced:
+            if pedal is not None:
+                inputs.set_pedal(b, pedal)
+            if throttle is not None:
+                inputs.set_throttle(b, throttle)
         # With the cam sensors not modelled, the crank handler accepts the
         # gap only at some speeds (it checks the cam levels against the
         # segment it expects, and restarts the search on a mismatch), so a
