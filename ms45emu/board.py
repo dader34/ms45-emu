@@ -18,7 +18,7 @@ from .qspi import Qspi
 from .qadc import Qadc, QADC_A, QADC_B
 from .toucan import TouCan
 from .sci import Sci
-from .cpu import Cpu, VEC_EXTERNAL, VEC_DECREMENTER, VEC_SYSCALL, MSR_FP, MSR_IP, SPR_EIE, SIU_SHADOW, BBCMCR_ETRE
+from .cpu import Cpu, VEC_EXTERNAL, VEC_DECREMENTER, VEC_SYSCALL, VEC_PROGRAM, SRR1_TRAP, MSR_FP, MSR_IP, SPR_EIE, SIU_SHADOW, BBCMCR_ETRE
 
 RESET_ENTRY = 0xFFF717B4         # the boot code after the reset vector's setup
 RESET_VECTOR = 0xFFF00100        # the real one, in the boot loader: starts the program only if it is marked valid
@@ -68,7 +68,7 @@ VALID_MARKS = ((0xFFF80, 0x42902448), (0xFFFC0, 0x42244890), (0x5FF80, 0x4824904
 BATTERY_CHANNEL = 50             # QADC B: supply voltage; the loader refuses to flash below 0x218
 BATTERY_OK = 0x320
 KL15_FLAG = 0x3FD853             # the DME's "KL15 on" state byte
-RAM_START, RAM_END = 0x3F8000, 0x400000
+RAM_START, RAM_END = 0x3F9800, 0x400000     # the 26 KB part: no SRAM at 0x3F8000
 
 # TB and DEC clock. The kernel tick is 2500 time-base units, the scheduler
 # runs every 5 ticks and the 10 ms CAN frame 0x316 every 10, so a tick is
@@ -161,11 +161,12 @@ class Board:
         self.siu.on_write(PISCR, self._piscr_write)
 
         # TPU: host service requests are acknowledged at once; CISR is write-0-to-clear
-        from .tpu import Tpu, Crank
+        from .tpu import Tpu, Crank, Coils
         self.tpu_a = Tpu(self.imb, 0x304000, "A")
         self.tpu_b = Tpu(self.imb, 0x304400, "B")
         self.tpu_requests = 0
         self.crank = Crank(self)
+        self.coils = Coils(self)
         for reg in TPU_HSRR:
             self.imb.on_write(reg, self._hsrr_write)
             self.imb.on_read(reg, lambda a, s: 0)
@@ -241,6 +242,7 @@ class Board:
         self.other_exceptions = Counter()
         self.probes = {}
         self.probe_counts = Counter()
+        self.traps = 0
         m.mu.hook_add(UC_HOOK_INTR, self._intr)
 
     # ---- probes -----------------------------------------------------------
@@ -444,7 +446,7 @@ class Board:
             return True
         return False
 
-    EXCP_FPU, EXCP_SYSCALL = 7, 8                 # QEMU's PowerPC exception numbers
+    EXCP_PROGRAM, EXCP_FPU, EXCP_SYSCALL = 6, 7, 8   # QEMU's PowerPC exception numbers
 
     def _intr(self, mu, intno, ud):
         pc = self.m.pc
@@ -456,6 +458,14 @@ class Board:
             w = self.m.read32(pc - 4)
             if (w >> 26) in (48, 49, 50, 51, 52, 53, 54, 55, 59, 63) or ((w >> 26) == 31 and ((w >> 1) & 0x3FF) in (535, 567, 599, 631, 663, 695, 727, 759)):
                 mu.reg_write(UC_PPC_REG_PC, pc - 4)
+            return
+        if intno == self.EXCP_PROGRAM and self.m.read32(pc - 4) >> 26 == 3:
+            # A trap instruction (twi): the program exception, SRR0 at the
+            # trap itself. The live-tune build reads its single values this
+            # way (ms45emu/singles.py).
+            self.traps += 1
+            mu.reg_write(UC_PPC_REG_PC, pc - 4)
+            self.cpu.raise_exception(VEC_PROGRAM, SRR1_TRAP)
             return
         if intno != self.EXCP_SYSCALL:
             self.other_exceptions[intno] += 1
@@ -508,9 +518,9 @@ class Board:
                     ahead = (self.siu.peek32(ref) - tb) & 0xFFFFFFFF
                     if ahead * self.clocks_per_tick < n:
                         n = ahead * self.clocks_per_tick + self.clocks_per_tick
-        event = self.crank.next_event()
-        if event is not None:
-            n = min(n, max(int(event) - self.instructions, 0) + self.clocks_per_tick)
+        for event in (self.crank.next_event(), self.coils.next_event()):
+            if event is not None:
+                n = min(n, max(int(event) - self.instructions, 0) + self.clocks_per_tick)
         if self._next_pit is not None:
             n = min(n, max(self._next_pit - self.instructions, 0) + self.clocks_per_tick)
         if self.qspi.done_at is not None:
@@ -530,6 +540,7 @@ class Board:
         self.sci.service()
         self.qspi.service()
         self.crank.service()
+        self.coils.service()
         # A software-started ADC scan takes real time, so it completes here.
         self.adc_a.service()
         self.adc_b.service()

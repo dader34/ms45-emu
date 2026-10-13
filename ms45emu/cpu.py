@@ -20,7 +20,8 @@ MSR_EE = 0x8000
 
 # Vector table in the MPC's first 0x100 bytes: entry n at 8*n is `ba handler`.
 VECTOR_STRIDE = 8
-VEC_MACHINE_CHECK, VEC_EXTERNAL, VEC_DECREMENTER, VEC_SYSCALL = 2, 5, 9, 12
+VEC_MACHINE_CHECK, VEC_EXTERNAL, VEC_PROGRAM, VEC_DECREMENTER, VEC_SYSCALL = 2, 5, 7, 9, 12
+SRR1_TRAP = 0x00020000         # a program exception raised by a trap instruction
 
 
 def _asm(words):
@@ -255,7 +256,7 @@ class Cpu:
         self.raise_stubs = {}
         i = 0
         for ip in (0, 1):
-            for vector in (VEC_MACHINE_CHECK, VEC_EXTERNAL, VEC_DECREMENTER, VEC_SYSCALL):
+            for vector in (VEC_MACHINE_CHECK, VEC_EXTERNAL, VEC_PROGRAM, VEC_DECREMENTER, VEC_SYSCALL):
                 stub = SCRATCH + 0x20 * i
                 i += 1
                 ba = m.read32(0xFFF00000 + vector * 0x100 if ip else vector * VECTOR_STRIDE)
@@ -317,10 +318,11 @@ class Cpu:
     def in_stub(self, pc):
         return SCRATCH <= pc < SCRATCH + 0x140 or MSR_STUB_BASE <= pc < MSR_STUB_BASE + MSR_STUB_SIZE
 
-    def raise_exception(self, vector):
+    def raise_exception(self, vector, srr1=0):
         """Enter the program's exception vector as the hardware would: SRR0 =
-        current pc, SRR1 = MSR, MSR[EE] cleared, pc = vector entry. The
-        program returns with rfi on its own; the caller just keeps running."""
+        current pc, SRR1 = MSR (and the cause bits in `srr1`), MSR[EE]
+        cleared, pc = vector entry. The program returns with rfi on its own;
+        the caller just keeps running."""
         m = self.m
         mu = m.mu
         pc = mu.reg_read(UC_PPC_REG_PC)
@@ -328,7 +330,7 @@ class Cpu:
         m.write32(self.saved_regs, m.reg(3))
         m.write32(self.saved_regs + 4, m.reg(4))
         m.set_reg(3, pc)
-        m.set_reg(4, msr)
+        m.set_reg(4, msr | srr1)
         mu.reg_write(UC_PPC_REG_MSR, msr & ~MSR_EE)
         # The loader runs with MSR[IP] and takes its exceptions at
         # 0xFFF00000. The program is started with IP still set but turns on

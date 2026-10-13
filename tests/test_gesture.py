@@ -12,8 +12,8 @@ def _power_up(m, stored=None):
     if stored is None:
         m.call(init)
     else:
-        m.write8(0x3F0100, stored)
-        m.call(restore, 0x3F0100)
+        m.write8(dme.SCRATCH, stored)
+        m.call(restore, dme.SCRATCH)
     return init, restore, save
 
 
@@ -87,7 +87,7 @@ def test_selection_survives_save_and_restore(patched):
     dme.select(patched, 1)
     patched.set_sda8(dme.NV_VAR, 2)                          # the stock variable keeps its value
 
-    buf = 0x3F0100
+    buf = dme.SCRATCH
     patched.call(save, buf)
     assert patched.read8(buf) == (1 << dme.NV_INDEX_SHIFT) | 2
 
@@ -102,7 +102,7 @@ def test_selection_survives_save_and_restore(patched):
 def test_restore_of_a_map_this_build_does_not_have_is_map_1(patched):
     # An earlier build's byte, or one from a build with more maps.
     init, restore, save = _power_up(patched)
-    buf = 0x3F0100
+    buf = dme.SCRATCH
     patched.write8(buf, (5 << dme.NV_INDEX_SHIFT) | 1)
     patched.call(restore, buf)
     assert dme.selected(patched) == 0

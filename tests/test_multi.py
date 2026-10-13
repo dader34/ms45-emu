@@ -73,8 +73,8 @@ def test_each_map_has_its_own_single_values(three):
     assert len({bytes(m[0x5EBC:0x5EBE]) for m in maps}) == 3
     for index in range(3):
         three.clear_ram()
-        three.write8(0x3F0100, index << dme.NV_INDEX_SHIFT)
-        three.call(restore, 0x3F0100)
+        three.write8(dme.SCRATCH, index << dme.NV_INDEX_SHIFT)
+        three.call(restore, dme.SCRATCH)
         assert dme.selected(three) == index
         r2 = three.reg(2)
         assert r2 == dme.map_r2(three, index)
@@ -100,12 +100,12 @@ def test_the_stored_byte_round_trips_every_map(three):
         three.clear_ram()
         dme.select(three, index)
         three.set_sda8(dme.NV_VAR, 1)
-        three.call(save, 0x3F0100)
-        stored = three.read8(0x3F0100)
+        three.call(save, dme.SCRATCH)
+        stored = three.read8(dme.SCRATCH)
         assert stored == (index << dme.NV_INDEX_SHIFT) | 1
         three.clear_ram()
-        three.write8(0x3F0100, stored)
-        three.call(restore, 0x3F0100)
+        three.write8(dme.SCRATCH, stored)
+        three.call(restore, dme.SCRATCH)
         assert dme.selected(three) == index
         assert three.sda8(dme.NV_VAR) == 1
 
@@ -136,8 +136,8 @@ def test_seven_maps_each_have_their_own_single_values(seven):
     r2s = set()
     for index in range(7):
         seven.clear_ram()
-        seven.write8(0x3F0100, index << dme.NV_INDEX_SHIFT)
-        seven.call(restore, 0x3F0100)
+        seven.write8(dme.SCRATCH, index << dme.NV_INDEX_SHIFT)
+        seven.call(restore, dme.SCRATCH)
         assert dme.selected(seven) == index
         r2 = seven.reg(2)
         assert r2 == dme.map_r2(seven, index)

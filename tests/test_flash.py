@@ -84,6 +84,115 @@ def test_wrong_checksum_is_refused(stock):
     assert not b.program_valid()
 
 
+def test_calibration_flash_skips_blank_blocks(stock):
+    """BMWeb leaves the all-0xFF blocks of an erased sector unsent, one
+    download per run of the others. The loader takes the sub-ranges and its
+    own signature check accepts the result: the stock calibration's last
+    125 blocks are blank."""
+    flash = stock.pair.flash
+    cal = flash[CALIBRATION:CALIBRATION_END]
+    runs = Tester.blank_runs(cal)
+    assert [(at, len(d)) for at, d in runs] == [(0, 345 * 253)]
+    b, t = _programming_session(stock.pair)
+    assert t.erase(EXTERNAL + CALIBRATION, 0x20000)
+    ok, sent = t.write_sparse(EXTERNAL + CALIBRATION, cal)
+    assert ok and sent == 345
+    assert bytes(b.flash.image[CALIBRATION:CALIBRATION_END]) == cal
+    assert t.default_mode()
+    assert t.check_signature("data")
+    assert _marks(b) == [mark.to_bytes(4, "big") for _, mark in VALID_MARKS]
+    assert t.reset()
+    assert _boots_program(b.reset())
+
+
+def test_sparse_download_edge_cases(stock):
+    """The loader takes a download at an odd address, one-block runs, a
+    non-blank partial last block and a lone byte in a blank block; the chip
+    ends up as the image says. (A changed calibration fails the signature,
+    so this checks contents only.) It does NOT refuse a range that leaves
+    the erased sector, which is why the runs are cut from the image itself."""
+    S = 253
+    cal = bytearray(stock.pair.flash[CALIBRATION:CALIBRATION_END])
+    def blank(*blocks):
+        for i in blocks:
+            cal[i * S:(i + 1) * S] = b"\xff" * len(cal[i * S:(i + 1) * S])
+    blank(0, 1, 2)                                   # leading: first run starts at +0x2F7
+    blank(10, 11, 12, 100)                           # interior gaps, a one-block gap
+    blank(*range(20, 40, 2))                         # ten one-block runs
+    blank(199, 200, 201); cal[200 * S + 77] = 0x5A   # a lone byte keeps its block
+    cal[469 * S:] = bytes(range(127))                # the partial last block, non-blank
+    cal = bytes(cal)
+    runs = Tester.blank_runs(cal)
+    assert runs[0][0] == 3 * S and runs[0][0] & 1
+    assert all(at + len(d) <= len(cal) for at, d in runs)
+    assert sum(-(-len(d) // S) for at, d in runs) == 470 - 3 - 4 - 10 - 2 - 124
+    b, t = _programming_session(stock.pair)
+    assert t.erase(EXTERNAL + CALIBRATION, 0x20000)
+    ok, sent = t.write_sparse(EXTERNAL + CALIBRATION, cal)
+    assert ok
+    assert bytes(b.flash.image[CALIBRATION:CALIBRATION_END]) == cal
+
+    # the hazard: a range across the sector end is taken and programmed
+    ok = t.write(EXTERNAL + CALIBRATION_END - S, b"\x11" * (2 * S))
+    assert ok
+    assert bytes(b.flash.image[CALIBRATION_END:CALIBRATION_END + S]) != stock.pair.flash[CALIBRATION_END:CALIBRATION_END + S]
+
+
+def test_programming_gap_is_exactly_12_ms(stock):
+    """The loader's access timing: P3min 12 ms is both its limit and the
+    only value it accepts; a block sent sooner is ignored and only taken on
+    the retransmit. BMWeb's TRANSFER_GAP_MS rests on this."""
+    b, t = _programming_session(stock.pair)
+    assert t.request([0x83, 0x00]) == bytes.fromhex("c300007818f000")
+    for p3 in (0x17, 0x10, 0x00, 0x32):
+        assert t.request([0x83, 0x03, 0x00, 0x78, p3, 0xF0, 0x00]) == bytes.fromhex("7f8322")
+    assert t.request([0x83, 0x03, 0x00, 0x78, 0x18, 0xF0, 0x00]) == bytes.fromhex("c303")
+    data = stock.pair.flash[CALIBRATION:CALIBRATION + 3 * 253]
+    assert t.erase(EXTERNAL + CALIBRATION, 0x20000)
+    t.gap = b.ips * 11 // 1000                       # 11 ms after the answer: too soon
+    t.step = b.ips // 4000
+    assert t.write(EXTERNAL + CALIBRATION, data)
+    ignored = sum(1 for req, rep in t.log if req and req[0] == 0x36 and not rep)
+    assert ignored == 3, "every block was dropped once and taken on the retry"
+    t.gap = b.ips * 12 // 1000
+    assert t.write(EXTERNAL + CALIBRATION + 3 * 253, data)
+    assert not any(not rep for req, rep in t.log[-4:] if req[0] == 0x36)
+
+
+STOCK_0PA = os.path.expanduser("~/Desktop/e46bins/MS45-DME/sp-daten/MDS451/7561382A.0PA")
+
+
+@pytest.mark.skipif(not os.environ.get("MS45_SLOW"), reason="minutes; set MS45_SLOW=1")
+@pytest.mark.skipif(not os.path.isfile(STOCK_0PA), reason="needs the stock program's .0PA from SP-Daten")
+def test_0pa_program_flash_skips_blank_blocks(stock):
+    """BMW's own .0PA of the stock program, written sparsely: no calibration,
+    no boot area and a header gap, so 13% of its blocks are blank. The stock
+    calibration stays valid, so the loader's checks and the boot judge it."""
+    from ms45emu.daten import records, _write, PROGRAM as PROG, EXTERNAL as WINDOW, MPC_SIZE
+    from ms45emu.machine import FLASH_SIZE
+    flash, mpc = bytearray(b"\xff" * FLASH_SIZE), bytearray(b"\xff" * MPC_SIZE)
+    recs = list(records(STOCK_0PA))
+    assert _write(mpc, 0, MPC_SIZE, 0, recs) and _write(flash, PROG[0], PROG[1], WINDOW, recs)
+    ext, mpc = bytes(flash[PROGRAM:PROGRAM_END]), bytes(mpc)
+    assert len(Tester.blank_runs(ext)) == 4 and len(Tester.blank_runs(mpc)) == 1
+
+    b, t = _programming_session(stock.pair)
+    assert t.erase(EXTERNAL + PROGRAM, 0xA0000)
+    ok, sent = t.write_sparse(EXTERNAL + PROGRAM, ext)
+    assert ok and sent == 2055
+    ok, sent = t.write_sparse(INTERNAL, mpc)
+    assert ok and sent == 1787
+    assert bytes(b.flash.image[PROGRAM:PROGRAM_END]) == ext
+    assert bytes(b.cmf.image) == mpc
+    assert t.default_mode()
+    assert t.programming_status() == 5
+    assert t.check_signature("program")
+    assert t.programming_status() == 1
+    assert _marks(b) == [mark.to_bytes(4, "big") for _, mark in VALID_MARKS]
+    assert t.reset()
+    assert _boots_program(b.reset())
+
+
 @pytest.mark.skipif(not os.environ.get("MS45_SLOW"), reason="minutes; set MS45_SLOW=1")
 def test_full_program_flash(stock):
     flash, mpc = stock.pair.flash, stock.pair.mpc

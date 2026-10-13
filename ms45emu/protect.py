@@ -2,10 +2,12 @@
 patch. Everything here cuts the ignition; nothing touches the limiter's
 stored value, so the processor monitor never sees a disagreement.
 
-Each of the three runtime ignition-fire sites (0x379CC, 0x193C4, 0x1976C)
-is redirected to a gate. The gate works out the lowest rpm at which spark
-should be cut from the current conditions, and returns without arming the
-coil once engine speed (r13-0x4BEC, 1 rpm/count) is at or above it:
+The routine that schedules a cylinder's spark (`ignition_fire_a`, MPC
+0x377A8: it writes the pulse into the cylinder's TPU channel and requests
+its service) begins with a jump to a gate. The gate works out the lowest
+rpm at which spark should be cut from the current conditions, and returns
+to the caller without scheduling anything once engine speed (r13-0x4BEC,
+1 rpm/count) is at or above it:
 
     spark cut      not in limp home  -> the program's own rev limit (r13-0x4BD6),
                                          whatever the tune, gear or map makes it
@@ -25,6 +27,15 @@ The two temperatures are live 8-bit variables, degrees C with a -40 offset:
 
     oil temp     r13-0x4026   (stock c_toil_max_accin compare, 0x59AA4)
     coolant temp r13-0x4038   (used ~80 places; the main tmot)
+
+The gate has to sit at the routine's entry because the routine has two
+callers. The segment task calls it (0x379CC), and so does a task per
+cylinder (the six stubs at 0x11D74, through 0x37A30, which ends in a jump to
+it), started by the TPU's interrupt when that cylinder's pulse is over: on a
+running engine every spark schedules the next one. An earlier version gated
+the segment task's call alone (and two channel set-up requests that are not
+sparks), so on the car the per-cylinder tasks went on scheduling and nothing
+was cut; `remove` and `build` still undo that version's three calls.
 
 `build(pair, config)` returns the patched pair with its safety-monitor
 sum, checksums and signature refreshed, so it flashes as a program; the
@@ -46,7 +57,10 @@ VAR_N = dme.VAR_N         # engine speed, 16 bit, 1 rpm/count
 OIL_WARN = -0x2F4C        # stock oil-temp check-control output byte
 TEMP_OFFSET = 40
 
-SITES = ((0x379CC, 0x377A8), (0x193C4, 0x1F938), (0x1976C, 0x1F938))
+ENTRY = 0x377A8           # ignition_fire_a: every spark is scheduled through here
+ENTRY_WORD = 0x7C0802A6   # its first instruction, mflr r0, which the gate does in its place
+# The three calls an earlier version redirected instead, and where each belongs.
+OLD_SITES = ((0x379CC, 0x377A8), (0x193C4, 0x1F938), (0x1976C, 0x1F938))
 
 VAR_N_MAX = -0x4BD6       # the engine speed limit the program's limiter works to, 16 bit, rpm
                           # (read only; never written by this patch)
@@ -161,14 +175,16 @@ BLT, BGE = (12, 0), (4, 0)
 BEQ, BNE = (12, 2), (4, 2)
 
 
-def _gate(addr, orig, cfg):
-    """An ignition site's gate. r12 holds the cut rpm, started at the program's
+def _gate(addr, cfg):
+    """The gate in front of the spark scheduling routine. r12 holds the cut rpm, started at the program's
     own stored rev limit (so the spark cut acts wherever the limiter would, for
     any tune/gear/map) and lowered to each temperature limit in force. When
-    engine speed reaches the cut rpm the coil is not armed; otherwise fall
-    through to the stock fire. r0, r11, r12 are scratch here; the stock fire
-    reloads what it needs. The stored rev limit is only read, never written,
-    so the safety monitor sees nothing changed."""
+    engine speed reaches the cut rpm it returns to the routine's caller with
+    nothing scheduled (r3, the cylinder, is what the routine returns too);
+    otherwise it does the routine's first instruction and goes on with the
+    second. r0, r11, r12 and cr0 are free at a function's entry. The stored rev
+    limit is only read, never written, so the safety monitor sees nothing
+    changed."""
     a = _Asm(addr)
     # r12 = cut rpm. Spark cut on -> start from the stored limit, except in
     # limp home, where the stock limiter is left to do its job alone; off ->
@@ -203,8 +219,9 @@ def _gate(addr, orig, cfg):
 
     a.lhz(0, 13, VAR_N)                                # engine speed
     a.cmplw(0, 12)
-    a.bclr(*BGE)                                       # N >= cut rpm -> return, coil not armed
-    a.b_abs(orig)                                      # else fire (LR still = site+4)
+    a.bclr(*BGE)                                       # N >= cut rpm -> back to the caller, no spark scheduled
+    a.emit(ENTRY_WORD)                                 # else the routine's own first instruction
+    a.b_abs(ENTRY + 4)                                 # and on with the rest of it
     return a.bytes()
 
 
@@ -234,8 +251,14 @@ def _in_area(addr):
 
 
 def _gated(mpc, site):
+    """Whether an earlier version's call into the code area sits at this site."""
     tgt, link = _decode_bl(mpc, site)
     return bool(link) and _in_area(tgt)
+
+
+def _entry_gated(mpc):
+    tgt, link = _decode_bl(mpc, ENTRY)
+    return not link and _in_area(tgt)
 
 
 def _limit_hooked(flash):
@@ -245,12 +268,22 @@ def _limit_hooked(flash):
 
 
 def is_patched(pair):
-    return _limit_hooked(pair.flash) or any(_gated(pair.mpc, site) for site, _ in SITES)
+    return _entry_gated(pair.mpc) or is_bypassed(pair)
+
+
+def is_bypassed(pair):
+    """Whether the pair carries an earlier version of the patch: one that cuts
+    nothing on a running engine (the three gated calls), or the limiter hook."""
+    return _limit_hooked(pair.flash) or any(_gated(pair.mpc, site) for site, _ in OLD_SITES)
 
 
 def remove(pair):
     flash, mpc = bytearray(pair.flash), bytearray(pair.mpc)
-    for site, orig in SITES:
+    if _entry_gated(mpc):
+        struct.pack_into(">I", mpc, ENTRY, ENTRY_WORD)
+    elif struct.unpack_from(">I", mpc, ENTRY)[0] != ENTRY_WORD:
+        raise ValueError(f"the routine at 0x{ENTRY:X} begins with neither its own instruction nor a protection patch")
+    for site, orig in OLD_SITES:                                    # an earlier version's calls
         tgt, link = _decode_bl(mpc, site)
         if tgt == orig:
             continue
@@ -269,7 +302,7 @@ def remove(pair):
 @dataclass(frozen=True)
 class Layout:
     config: Config
-    gates: tuple            # (site, gate address) per ignition site
+    gate: int | None        # the gate's address, None when nothing is switched on
     code_end: int
 
 
@@ -283,33 +316,28 @@ def build(pair, config=None, **overrides):
         pair = remove(pair)
     flash, mpc = bytearray(pair.flash), bytearray(pair.mpc)
 
-    for site, orig in SITES:
+    if struct.unpack_from(">I", mpc, ENTRY)[0] != ENTRY_WORD:
+        raise ValueError(f"the program does not carry the expected spark scheduling routine at 0x{ENTRY:X}")
+    for site, orig in OLD_SITES:
         tgt, link = _decode_bl(mpc, site)
         if not link or tgt != orig:
             raise ValueError(f"the program does not carry the expected ignition call at 0x{site:X}")
     if struct.unpack_from(">I", flash, LIMIT_SITE)[0] != LIMIT_STORE:
         raise ValueError(f"the program does not store its engine speed limit at 0x{LIMIT_SITE:X} the expected way")
 
-    # One gate per ignition site, each sized to its own folded-in limits.
-    pc = EXT + CODE_START
-    blobs, gates = [], []
-    enabled = cfg.spark_cut or _has_limits(cfg)
-    if enabled:
-        for site, orig in SITES:
-            blob = _gate(pc, orig, cfg)
-            blobs.append((pc, blob))
-            gates.append((site, pc))
-            pc += len(blob)
-    need_end = pc - EXT
+    gate, blob = None, b""
+    if cfg.spark_cut or _has_limits(cfg):
+        gate = EXT + CODE_START
+        blob = _gate(gate, cfg)
+    need_end = CODE_START + len(blob)
     if need_end > CODE_END:
         raise ValueError("the code does not fit in the free flash area")
     if flash[CODE_START:need_end] != b"\xff" * (need_end - CODE_START):
         raise ValueError(f"the external flash is not empty at 0x{CODE_START:X}..0x{need_end:X}")
 
-    for at, blob in blobs:
-        flash[at - EXT:at - EXT + len(blob)] = blob
-    for site, gate_pc in gates:
-        struct.pack_into(">I", mpc, site, _branch(site, gate_pc, link=1))
+    if gate is not None:
+        flash[CODE_START:need_end] = blob
+        struct.pack_into(">I", mpc, ENTRY, _branch(ENTRY, gate))
 
     fix_program(flash, mpc)
-    return Pair(bytes(flash), bytes(mpc), pair.name + "+protect"), Layout(cfg, tuple(gates), need_end)
+    return Pair(bytes(flash), bytes(mpc), pair.name + "+protect"), Layout(cfg, gate, need_end)

@@ -147,7 +147,8 @@ class Crank:
 
     The cam sensors are not driven: with their lines at rest the program
     takes the first gap as the start of the cycle. Ignition and injection
-    are not timed off this angle either, only acknowledged as before."""
+    are not timed off this angle either: injection is only acknowledged
+    as before, ignition runs through `Coils`."""
 
     def __init__(self, board):
         self.b = board
@@ -282,3 +283,80 @@ class Crank:
             self.stall_at = None
             self.teeth_seen = 0
             self._report(STATE_STOPPED)
+
+
+# ---- the coils ---------------------------------------------------------------
+IGNITION_CHANNELS = 6                          # TPU A channels 0-5, one per cylinder
+HSR_SCHEDULE = 1                               # the request ignition_fire_a makes for a pulse
+SPARK_TOOTH, SPARK_SPACING = 10, 20            # where in the cycle a cylinder's pulse ends, and the next one's
+
+
+class Coils:
+    """The microcode's side of the six ignition channels, as far as the
+    program's scheduling depends on it.
+
+    A pulse is one shot: the program writes it into the channel and
+    requests service (request 1), the pulse runs at its angle, and when it
+    is over the channel interrupts. The program's handler for that
+    interrupt starts the cylinder's own task, and that task schedules the
+    cylinder's next pulse. So on a running engine the sparks keep
+    themselves going, and whatever is to cut them has to stop every caller
+    of the scheduling routine, not only the segment task's.
+
+    Here a requested channel fires once, when the crank next reaches that
+    cylinder's place in the cycle (one place per cylinder, 120 degrees
+    apart; the order and the true angle are not modelled), is recorded in
+    `sparks` as (channel, instruction), and raises its interrupt. Without a
+    request there is no pulse. The words the handler reads back (the angle
+    in word 5, the duration in word 6, the level in byte 9) are left as
+    they are, so its plausibility bit (bit 2 of r13-0x74F4) is not to be
+    trusted on the emulator."""
+
+    def __init__(self, board):
+        self.b = board
+        self.t = board.tpu_a
+        self.cisr = self.t.base + CISR
+        self.armed = set()
+        self.sparks = []
+        self.on_spark = None              # fn(channel, instruction) as each pulse ends
+        self._seen = None                 # (the crank's origin, slot) at the last service
+        self._chained = self.t.on_request
+        self.t.on_request = self._request
+
+    def _request(self, ch, request):
+        if self._chained is not None:
+            self._chained(ch, request)
+        if ch < IGNITION_CHANNELS and self.t.role(ch) == "ignition":
+            if request == HSR_SCHEDULE:
+                self.armed.add(ch)
+            else:
+                self.armed.discard(ch)    # set up again: whatever was scheduled is gone
+
+    def _slot(self, position):
+        """How many cylinders' places the crank has gone by in this cycle."""
+        return int((position - SPARK_TOOTH) % TEETH_PER_CYCLE // SPARK_SPACING)
+
+    def next_event(self):
+        crank = self.b.crank
+        if not self.armed or crank.rpm <= 0:
+            return None
+        ahead = SPARK_SPACING - (crank.position() - SPARK_TOOTH) % SPARK_SPACING
+        return self.b.instructions + ahead * crank.tooth_instructions
+
+    def service(self):
+        crank = self.b.crank
+        slot = self._slot(crank.position())
+        was, self._seen = self._seen, (crank._origin, slot)
+        if was is None or was[0] != crank._origin:        # the wheel was moved under us: start again from here
+            return
+        slots = TEETH_PER_CYCLE // SPARK_SPACING
+        for k in range(1, (slot - was[1]) % slots + 1):
+            ch = (was[1] + k) % slots
+            if ch in self.armed:
+                self.armed.discard(ch)
+                self.sparks.append((ch, self.b.instructions))
+                if len(self.sparks) > 4000:
+                    del self.sparks[:2000]
+                if self.on_spark is not None:
+                    self.on_spark(ch, self.b.instructions)
+                self.b.imb.poke16(self.cisr, self.b.imb.peek16(self.cisr) | (1 << ch))

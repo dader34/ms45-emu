@@ -51,7 +51,8 @@ it, so the pair then only needs its external flash (MS45_FLASH).
 
 The ignition is on to begin with. `i` and Enter here toggles it, and so
 do http://localhost:PORT/ignition/off, /on and /toggle on the --ws port
-(/ignition shows it). A tester reads it where a K+DCAN cable has it, on
+(/ignition shows it). /rpm/N and /pedal/N there turn the crank at N rpm and
+hold the pedal at N %. A tester reads it where a K+DCAN cable has it, on
 DSR. With the ignition off the program does its after-run, writes the
 EEPROM and parks, and the DME is then without power; the boot loader
 holds no main relay and is off at once. Ignition on starts a DME that
@@ -94,6 +95,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ms45emu import load_pair                 # noqa: E402
 from ms45emu.board import Board, VALID_MARKS  # noqa: E402
 from ms45emu.image import Pair                # noqa: E402
+from ms45emu.inputs import set_pedal          # noqa: E402
 
 from ms45emu.sci import SCC1R0, CLOCK         # noqa: E402
 
@@ -337,6 +339,13 @@ class WebSocket:
             print(f"{time.strftime('%H:%M:%S')} {self.name}: {lines[0][:60]}", flush=True)
             if path.startswith("/ignition"):
                 body, kind = self._ignition_page(path), b"text/html"
+            elif path.startswith(("/rpm/", "/pedal/")):
+                _, what, value = path.rstrip("/").split("/")[:3]
+                try:
+                    self.commands.append((what, float(value)))
+                    body, kind = f"{what} {float(value):g}\n".encode(), b"text/plain"
+                except ValueError:
+                    body, kind = f"{what}: not a number\n".encode(), b"text/plain"
             elif "webserial-emu.js" in path:
                 body, kind = open(self.SHIM, "rb").read(), b"text/javascript"
             else:
@@ -726,7 +735,7 @@ def wrong_rate(line, baud):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--pair", default="patched", choices=["stock", "patched"])
+    ap.add_argument("--pair", default="patched", choices=["stock", "patched", "livetune"])
     ap.add_argument("--program", default=None, metavar="FILE.0PA",
                     help="one of BMW's program files, written onto the pair first (its boot loader is kept)")
     ap.add_argument("--calibration", default=None, metavar="FILE.0DA",
@@ -773,7 +782,27 @@ def main():
     print("K line on " + ", ".join(line.name for line in lines)
           + (f" (also {args.link})" if args.link and not args.port else ""), flush=True)
 
-    if args.program or args.calibration:
+    fold_reset_pcs = ()                # the live-tune fold's self-reset spin (see the loop)
+    if args.pair == "livetune":
+        # the live-tune program: overlay + transport + fold on the car's own
+        # session1 pair, built here so BMWeb's live-tune screen has a DME to
+        # drive (tools/livetune_build.py writes the same pair to disk).
+        from ms45emu import fold, overlay, singles, transport
+        from ms45emu.image import IMAGES_DIR
+        with open(os.path.join(IMAGES_DIR, "session1.flash.bin"), "rb") as f, \
+             open(os.path.join(IMAGES_DIR, "session1.mpc.bin"), "rb") as m:
+            pair = Pair(f.read(), m.read(), "session1")
+        pair = singles.build(fold.build(transport.build(overlay.build(pair))))
+        # After a save the fold spins at DONE/FAILED and stops servicing the
+        # watchdog, so on real silicon the watchdog forces a reset and the
+        # program reboots onto the saved calibration. The emulator does not
+        # model the watchdog firing, so the loop watches for the PC parked
+        # here and reboots the board itself. The emulator runs the MPC image
+        # at its own low addresses, so these are fold.DONE/FAILED as-is (PC
+        # observed at 0x6F8E0, not the 0xFFF-mapped runtime address).
+        fold_reset_pcs = (fold.DONE, fold.FAILED)
+        print(f"booting {pair.name} (live-tune build)", flush=True)
+    elif args.program or args.calibration:
         from ms45emu import daten                # a .0PA / .0DA on the pair's boot loader (ms45emu/daten.py)
         pair = daten.load(args.pair, args.program, args.calibration, say=lambda text: print(text, flush=True))
         print(f"booting {pair.name}: program {pair.program_id.decode('latin1')}", flush=True)
@@ -834,11 +863,12 @@ def main():
     ignition = True                    # KL15
     powered = True                     # False once the main relay has dropped: the CPU stands still
     off_at, parked = 0, 0              # DME time of ignition off, and looks in a row that found the program parked
+    fold_spin = 0                      # slices in a row the PC sat in the fold's post-save reset spin
     active_at = time.time()            # wall time of the latest tester bytes or command (--idle-timeout)
 
     def reset_board(why):
         """A new board on what the flash and the EEPROM hold now, started from the reset vector."""
-        nonlocal board, epoch, in_flight, off_at, parked
+        nonlocal board, epoch, in_flight, off_at, parked, fold_spin
         board = board.reset()
         board.ignition(ignition)
         board.sci.on_tx = lambda byte: out.append((byte, dme_baud(board)))
@@ -848,7 +878,7 @@ def main():
         board.crank.rpm = args.rpm
         epoch = (time.time(), board.instructions)
         in_flight = False
-        off_at, parked = 0, 0
+        off_at, parked, fold_spin = 0, 0, 0
 
     def power_off(why):
         nonlocal powered, in_flight
@@ -926,7 +956,17 @@ def main():
                     line.service()
                     while line.commands:
                         active_at = time.time()
-                        set_ignition(line.commands.pop(0))
+                        command = line.commands.pop(0)
+                        if isinstance(command, tuple):                # the engine, for whoever is driving
+                            what, value = command
+                            if what == "rpm":
+                                args.rpm = value                      # kept across a reset
+                                board.crank.rpm = value
+                            else:
+                                set_pedal(board, value)
+                            print(f"{time.strftime('%H:%M:%S')} {what} {value:g}", flush=True)
+                        else:
+                            set_ignition(command)
             if args.idle_timeout and time.time() - active_at > args.idle_timeout:
                 idle = f"{args.idle_timeout / 60:g} min" if args.idle_timeout >= 60 else f"{args.idle_timeout:g} s"
                 print(f"{stamp()} nothing from a tester for {idle}: quitting", flush=True)
@@ -944,6 +984,19 @@ def main():
             board.run(slice_instructions)
             if watch and time.time() - last_turn > 0.15:
                 print(f"{stamp()} watch: one slice of the DME took {(time.time() - last_turn) * 1000:.0f} ms", flush=True)
+            # The live-tune fold ends in a watchdog self-reset: it spins at
+            # DONE/FAILED, the watchdog times out, and the chip reboots onto
+            # the saved calibration. The emulator does not model the watchdog
+            # firing, so when the PC parks here across a couple of slices we
+            # perform that reboot (how a real DME comes back after a save).
+            if fold_reset_pcs and board.m.pc in fold_reset_pcs:
+                fold_spin += 1
+                if fold_spin >= 2:
+                    fold_spin = 0
+                    reset_board("save done: the fold's watchdog reset")
+                    continue
+            else:
+                fold_spin = 0
             if not ignition:
                 # The program parks in RAM when its after-run is done and
                 # waits for the main relay to let go of it.

@@ -76,7 +76,7 @@
     "0xFFFD2968": "mo3_self_reset",
     "0x1B538": "pwm_duty_update",
     "0x1CC7C": "os_event_drain",
-    "0x1F938": "ignition_fire_b",
+    "0x1F938": "tpu_request_service",
     "0x20918": "decrementer_handler",
     "0x26170": "fault_report",
     "0x2657C": "fault_report_b",

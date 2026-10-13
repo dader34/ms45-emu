@@ -6,10 +6,18 @@ the DME is partitioned: boot loader in the small sectors and the 128 KB
 one below 0x40000, calibration in the 128 KB sector at 0x40000, program in
 the 128 + 256 + 256 KB above. The DME's RAM-resident driver unlocks it
 (AA@555, 55@2AA), issues a command, then polls the chip until the
-operation finishes. We do not model the real toggle-bit/data-poll timing:
-erase and program are applied the instant the command completes, so the
-driver's very first completion poll reads the final data and the state
+operation finishes. By default we do not model the real toggle-bit/data-poll
+timing: erase and program are applied the instant the command completes, so
+the driver's very first completion poll reads the final data and the state
 machine advances.
+
+`strict()` models the busy part instead, for code that drives the chip while
+the program runs (the live-tune save): the part is not a simultaneous
+read/write device, so until an operation finishes every read answers status
+(DQ7 inverted data, DQ6 toggling) and nothing can be fetched. In strict mode
+the polled address reads status for a few polls and then the data; a fetch
+from the chip, a read anywhere else in it, or a command while it is busy is
+recorded in `violations` -- on the car each of those is a crash.
 
 `image` is what the chip holds. The emulator's memory is that plus the
 emulator's own patches (see cpu.py), so the chip content is kept apart
@@ -59,6 +67,51 @@ class FlashChip:
         self.erases = 0
         self.programs = 0
         self.log = []
+        self.busy = None                                     # strict mode: [offset, final bytes, status, polls left]
+        self.polls = None                                    # None = not strict
+        self.violations = []
+
+    # ---- the busy part (opt-in) -------------------------------------------
+    def strict(self, polls=3):
+        """Answer status while an operation runs and record what the car
+        would not survive. Costs a hook on every read of the chip, so it is
+        switched on by the tests that drive the chip from the program."""
+        from unicorn import UC_HOOK_BLOCK, UC_HOOK_MEM_READ
+        if self.polls is None:
+            for base in self.windows:
+                self.m.mu.hook_add(UC_HOOK_MEM_READ, self._busy_read, begin=base, end=base + self.size - 1)
+                self.m.mu.hook_add(UC_HOOK_BLOCK, self._busy_fetch, begin=base, end=base + self.size - 1)
+            self.m.mu.ctl_flush_tb()
+        self.polls = polls
+
+    def _show(self, offset, data):
+        for base in self.windows:
+            self.m.mu.mem_write(base + offset, data)
+
+    def _start(self, offset, final, status):
+        """An operation began at `offset`: status there until it is polled out."""
+        offset &= ~1
+        self.busy = [offset, final, status, self.polls]
+        self._show(offset, status.to_bytes(2, "big"))
+
+    def _busy_read(self, uc, access, addr, size, value, user):
+        if self.busy is None:
+            return
+        offset = addr & (self.size - 1)
+        if offset & ~1 != self.busy[0]:
+            self.violations.append(("read", self.m.pc, offset))
+            return
+        self.busy[3] -= 1
+        if self.busy[3] <= 0:
+            self._show(self.busy[0], self.busy[1])           # done: the array data
+            self.busy = None
+        else:
+            self.busy[2] ^= 0x40                             # DQ6 toggles on every read
+            self._show(self.busy[0], self.busy[2].to_bytes(2, "big"))
+
+    def _busy_fetch(self, uc, addr, size, user):
+        if self.busy is not None:
+            self.violations.append(("fetch", addr, self.busy[0]))
 
     # ---- helpers ----------------------------------------------------------
     def add_window(self, base):
@@ -93,12 +146,17 @@ class FlashChip:
         offset = addr & (self.size - 1)
         low = offset & 0xFFE          # command-matching address (word aligned)
         v = value & 0xFF
+        if self.busy is not None:
+            self.violations.append(("command", self.m.pc, offset))
 
         # The data cycle of a program command (AA, 55, A0, then <addr>=<data>)
         # is data whatever it looks like. Programming only clears bits.
         if self.cmd[-3:] == self._PROGRAM:
             old = self._read_word(offset)
-            self.store(offset, (old & value & 0xFFFF).to_bytes(2, "big"))
+            new = (old & value & 0xFFFF).to_bytes(2, "big")
+            self.store(offset, new)
+            if self.polls:                                   # DQ7 is the datum's bit 7, inverted
+                self._start(offset, new, ~value & 0x80)
             self.programs += 1
             self.cmd.clear()
             return True
@@ -138,4 +196,6 @@ class FlashChip:
         for start, size in SECTORS:
             if start <= offset < start + size:
                 self._erase_range(start, size)
+                if self.polls and self.busy is None:         # DQ7 0, DQ3 1 while it erases
+                    self._start(offset, b"\xff\xff", 0x08)
                 return

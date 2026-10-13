@@ -83,6 +83,11 @@ KWP_FAST_TIMING = (2, 12)    # what `83 03 04 01 18 14 00` leaves there: the lim
 HEAP_BOTTOM = -0x7708        # next free address from below, 32 bit
 HEAP_TOP = -0x7704           # lowest address taken from above, 32 bit
 HEAP_START, HEAP_END = 0x3FF2A0, 0x3FF900
+SCRATCH = 0x3F9980                       # harness scratch for m.call contexts (romtest,
+                                         # multi, gesture). The transport's state block
+                                         # moved to the descriptor gap 0x3F9E74: this
+                                         # 0x3F99xx band is inside the KWP receive walker's
+                                         # reach, fine only where no telegram is processed
 
 SEGMENT_TASK_LAST_CALL = 0x3235C         # bl 0x32180, the last thing the segment task does
 FRAME_TASK_BUILDER_CALL = 0x4BE9C        # bl 0x4B528, the 10 ms task calling the 0x316 builder
@@ -90,7 +95,7 @@ FRAME_TASK_BUILDER_CALL = 0x4BE9C        # bl 0x4B528, the 10 ms task calling th
 
 def romtest_sum_native(m):
     """The code sum as the DME computes it, by running its own accumulator."""
-    acc = 0x3F0000
+    acc = SCRATCH
     m.write32(acc, ROMTEST_SEED >> 32)
     m.write32(acc + 4, ROMTEST_SEED & 0xFFFFFFFF)
     for i in range(3):

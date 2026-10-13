@@ -2,8 +2,9 @@
 built onto the stock pair and run in the emulator, with temperatures forced
 through their RAM variables.
 
-Everything is a spark cut now, so what is checked is spark counts, the oil
-warning byte, and that the limiter's own stored limit and flags are left
+Everything is a spark cut now, so what is checked is spark counts (pulses
+the coil model in ms45emu/tpu.py ran, each of which the program had to
+schedule: a request alone is not a spark), the oil warning byte, and that the limiter's own stored limit and flags are left
 exactly as the stock program sets them (the safety monitor keeps a redundant
 copy of the limiter state and resets the DME when the two disagree).
 
@@ -11,8 +12,10 @@ The emulator has no throttle body, so the stock program sits in its limp
 home limit of 1312 rpm (c_n_max_mtc_lih) with the limp flag set. Most tests
 run a pair with that limit and flag taken out, to see an engine in order.
 The cam-less emulator also collapses engine speed to 0 between crank
-resyncs above ~4000 rpm (docs/full-boot.md), so low test limits are used
-and the few residual sparks above a cut are the N==0 dips.
+resyncs above ~4000 rpm (docs/full-boot.md), so low test limits are used.
+Below that it still reads a third of the true speed for a few ms at every
+resync, and the program rightly schedules sparks then; a spark is counted
+by the speed the program read when it scheduled it, and those are left out.
 """
 import os
 import struct
@@ -24,6 +27,7 @@ from ms45emu import Machine, checksums, dme, protect
 from ms45emu.board import Board, RESET_ENTRY
 from ms45emu.image import Pair
 from ms45emu.machine import R13
+from ms45emu.tpu import IGNITION_CHANNELS, HSR_SCHEDULE
 
 FRAME = 400_000
 SECOND = 100 * FRAME
@@ -39,6 +43,7 @@ ID_N_MAX_MT = 0x40000 + 0x612E  # the limit by gear, nine words
 ID_N_MAX_H_MT = 0x40000 + 0x611C  # and the raised limit the program allows for a while, the same on a stock tune
 # Low test values: 2300 rpm is above every temperature limit, 2500 above the low rev limit.
 CFG = protect.Config(spark_cut=True, oil_c=70, oil_rpm=2100, cool_c=90, cool_rpm=2150, cold_warm_c=60, cold_rpm=2000)
+CYLINDER_TASK = 0x37A30         # what each cylinder's own task runs when its pulse is over; it ends in ignition_fire_a
 LOW_LIMIT = 2400                # a rev limit the emulator can run through, for the spark cut
 
 
@@ -81,10 +86,25 @@ class Trial:
         def reset(board):
             self.resets += 1
         b.probe(RESET_ENTRY, "reset", on_hit=reset)
+        b.probe(CYLINDER_TASK, "cylinder task")
         oil, cool = oil_c + protect.TEMP_OFFSET, cool_c + protect.TEMP_OFFSET
         b.m.write8(R13 + protect.OIL_WARN, 0)
         b.crank.rpm = rpm
         seen = []
+        scheduled = {}                              # channel -> the engine speed read when its pulse was last requested
+        chained = b.tpu_a.on_request
+
+        def request(ch, kind):
+            chained(ch, kind)
+            if ch < IGNITION_CHANNELS and kind == HSR_SCHEDULE:
+                scheduled[ch] = b.m.read16(R13 + protect.VAR_N)
+        b.tpu_a.on_request = request
+        at_speed = []
+
+        def spark(ch, now):
+            if scheduled.get(ch, 0) >= rpm * 0.9:
+                at_speed.append(ch)
+        b.coils.on_spark = spark
 
         def run(seconds):
             for _ in range(self.STEPS):
@@ -95,10 +115,12 @@ class Trial:
 
         run(0.3)                                    # let everything see the conditions
         seen.clear()
-        b.tpu_a.pulses.clear()
+        at_speed.clear()
         b.tpu_b.pulses.clear()
+        b.probe_counts["cylinder task"] = 0
         run(seconds)
-        self.sparks = sum(1 for ch, r, t in b.tpu_a.pulses if r == "ignition")
+        self.sparks = len(at_speed)
+        self.cylinder_tasks = b.probe_counts["cylinder task"]
         self.injections = sum(1 for ch, r, t in b.tpu_b.pulses if r == "injection")
         self.oil_warning = b.m.read8(R13 + protect.OIL_WARN)
         self.limit, self.limiting, self.fuel_cut = Counter(seen).most_common(1)[0][0]
@@ -113,7 +135,7 @@ def base(stock):
 def test_only_the_gates_change(stock):
     pair, layout = protect.build(stock.pair, CFG)
     changed = {i & ~3 for i in range(len(pair.mpc)) if pair.mpc[i] != stock.pair.mpc[i]}
-    assert changed == {site for site, _ in protect.SITES}
+    assert changed == {protect.ENTRY}
     allowed = set(range(protect.CODE_START, layout.code_end)) \
         | set(range(0x60000, 0x60004)) | set(range(0x60074, 0x600B4)) | set(range(0x60340, 0x60344))
     assert {i for i in range(len(pair.flash)) if pair.flash[i] != stock.pair.flash[i]} <= allowed
@@ -138,7 +160,7 @@ def test_remove_restores_stock(stock):
 
 def test_gates_only_when_something_is_on(stock):
     limits_only, layout = protect.build(stock.pair, CFG, spark_cut=False)
-    assert len(layout.gates) == 3 and protect.is_patched(limits_only)        # temperature limits are spark cuts too
+    assert layout.gate is not None and protect.is_patched(limits_only)       # temperature limits are spark cuts too
     nothing, _ = protect.build(stock.pair, CFG, spark_cut=False, oil_c=None, cool_c=None, cold_warm_c=None)
     assert nothing.flash == stock.pair.flash and nothing.mpc == stock.pair.mpc
     # a rebuild with less replaces the gates whole
@@ -162,6 +184,39 @@ def test_an_earlier_builds_limiter_hook_is_undone(stock):
     rebuilt, _ = protect.build(old, CFG)
     assert rebuilt.flash == protect.build(stock.pair, CFG)[0].flash
     assert rebuilt.flash[protect.LIMIT_SITE:protect.LIMIT_SITE + 4] == stock.pair.flash[protect.LIMIT_SITE:protect.LIMIT_SITE + 4]
+
+
+def _earlier_build(pair, cfg):
+    """The pair as the version before this one patched it: a gate on the
+    segment task's call and on two channel set-up requests, the scheduling
+    routine itself left open to the per-cylinder tasks."""
+    flash, mpc = bytearray(pair.flash), bytearray(pair.mpc)
+    pc = protect.EXT + protect.CODE_START
+    for site, orig in protect.OLD_SITES:
+        a = protect._Asm(pc)
+        a.li(12, protect.NO_CUT)
+        a.lbz(11, 13, protect.VAR_COOL); a.cmplwi(11, cfg.cold_warm_c + protect.TEMP_OFFSET); a.bc(*protect.BGE, "warm")
+        a.li(12, cfg.cold_rpm)
+        a.label("warm")
+        a.lhz(0, 13, protect.VAR_N); a.cmplw(0, 12); a.bclr(*protect.BGE)
+        a.b_abs(orig)
+        blob = a.bytes()
+        flash[pc - protect.EXT:pc - protect.EXT + len(blob)] = blob
+        struct.pack_into(">I", mpc, site, protect._branch(site, pc, link=1))
+        pc += len(blob)
+    checksums.fix_program(flash, mpc)
+    return Pair(bytes(flash), bytes(mpc), pair.name + "+earlier")
+
+
+def test_an_earlier_builds_three_gates_are_undone(stock):
+    old = _earlier_build(stock.pair, CFG)
+    assert protect.is_patched(old) and protect.is_bypassed(old)
+    stripped = protect.remove(old)
+    assert stripped.flash == stock.pair.flash and stripped.mpc == stock.pair.mpc
+    rebuilt, _ = protect.build(old, CFG)
+    fresh, _ = protect.build(stock.pair, CFG)
+    assert rebuilt.flash == fresh.flash and rebuilt.mpc == fresh.mpc
+    assert protect.is_patched(fresh) and not protect.is_bypassed(fresh)
 
 
 def test_insane_values_refused(stock):
@@ -190,6 +245,23 @@ def test_cold_start_cuts_spark_until_warm(base):
     for t in (fast, slow):
         assert t.resets == 0
         assert (t.limit, t.limiting, t.fuel_cut) == (STOCK_LIMIT, 0, 0), "the stock limiter is never involved"
+
+
+def test_the_cut_holds_against_the_per_cylinder_tasks(base):
+    """A pulse that is over starts its cylinder's task, which schedules the
+    next one, so on a car the sparks keep themselves going whatever the
+    segment task does: the version that gated only the segment task's call
+    cut nothing there. Here the crank's resyncs break those chains every
+    tenth of a second, so that version still loses most of its sparks, but
+    every one it has left was scheduled at speed, above the cut, by a
+    cylinder's task. With the gate at the routine's entry there is none."""
+    warm = Trial(base, oil_c=50, cool_c=83, rpm=2500)
+    assert warm.sparks > 40 and warm.cylinder_tasks >= warm.sparks * 0.9, "each pulse runs its cylinder's task"
+    earlier = Trial(_earlier_build(base, CFG), oil_c=50, cool_c=40, rpm=2500)
+    assert earlier.sparks > 5, "the earlier build lets the cylinders' tasks schedule above the cut"
+    now = Trial(protect.build(base, CFG)[0], oil_c=50, cool_c=40, rpm=2500)
+    assert now.sparks == 0 and now.resets == 0
+    assert now.injections > 300
 
 
 def test_oil_protection_cuts_spark_and_warns(base):

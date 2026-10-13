@@ -216,3 +216,31 @@ class Tester:
                 progress(at + size, len(data))
         r = self.request([0x37] + region)
         return bool(r) and r[0] == 0x77
+
+    @staticmethod
+    def blank_runs(data, size=253):
+        """The runs of `data` worth sending after an erase: consecutive
+        `size`-byte blocks that are not all 0xFF, as (offset, bytes). An
+        erased sector reads 0xFF and programming 0xFF over 0xFF changes
+        nothing, so the blank blocks are left out (what BMWeb does)."""
+        runs, run = [], None
+        for at in range(0, len(data), size):
+            chunk = data[at:at + size]
+            if chunk.count(0xFF) == len(chunk):
+                run = None
+            elif run is None:
+                run = [at, bytearray(chunk)]
+                runs.append(run)
+            else:
+                run[1] += chunk
+        return [(at, bytes(d)) for at, d in runs]
+
+    def write_sparse(self, start, data, progress=None):
+        """`write`, but one download per run of non-blank blocks; the blank
+        ones are never sent. Returns (ok, blocks sent)."""
+        sent = 0
+        for at, run in self.blank_runs(data):
+            if not self.write(start + at, run, progress):
+                return False, sent
+            sent += -(-len(run) // 253)
+        return True, sent

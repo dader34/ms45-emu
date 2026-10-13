@@ -4,7 +4,8 @@ Memory map (CPU addresses):
 
   0x00000000  MPC internal flash, 448 KB (the "MPC" image)
   0x002F8000  SIU / memory controller / peripheral registers (IMMR = 0x002F0000)
-  0x003F8000  internal SRAM up to 0x00400000; r1 starts at 0x00400000
+  0x003F9800  internal SRAM up to 0x00400000 (the 26 KB part; 0x3F8000 is
+              unimplemented silicon); r1 starts at 0x00400000
   0xFFE00000  external flash, 2 MB chip-select window over the 1 MB chip, so
               0xFFExxxxx and 0xFFFxxxxx are the same bytes. The program lives
               at 0xFFF60000+, the calibration is addressed as 0xFFE40000+.
@@ -17,7 +18,8 @@ register to behave install a hook.
 """
 import struct
 
-from unicorn import Uc, UC_ARCH_PPC, UC_MODE_32, UC_MODE_BIG_ENDIAN, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE, UC_HOOK_CODE, UcError
+from unicorn import (Uc, UC_ARCH_PPC, UC_MODE_32, UC_MODE_BIG_ENDIAN, UC_HOOK_MEM_READ,
+                     UC_HOOK_MEM_WRITE, UC_HOOK_MEM_FETCH, UC_HOOK_CODE, UcError)
 from unicorn.ppc_const import UC_PPC_REG_0, UC_PPC_REG_PC, UC_PPC_REG_LR, UC_PPC_REG_CR, UC_PPC_REG_XER, UC_PPC_REG_CTR
 
 R13 = 0x004017F0
@@ -27,9 +29,11 @@ MPC_BASE = 0x00000000
 MPC_MAP = 0x80000               # mapped size, page rounded
 PERIPH_BASE = 0x002F0000
 PERIPH_SIZE = 0x20000
-RAM_BASE = 0x003F0000
-RAM_SIZE = 0x10000              # to 0x00400000
-RAM_TOP = RAM_BASE + RAM_SIZE
+RAM_BASE = 0x003F9800            # the MPC555 is the 26 KB part: 0x3F8000-0x3F97FF
+RAM_SIZE = 0x6800                # is unimplemented silicon (UM Rev 15, Table A-14;
+RAM_TOP = RAM_BASE + RAM_SIZE    # the loader's clear/self-test also start at 0x3F9800)
+RAM_PAGE = RAM_BASE & ~0xFFF     # Unicorn maps 4 KB pages; the real base is mid-page,
+                                 # so the rest of that page is mapped but guarded below
 EXT_BASE = 0xFFE00000
 EXT_SIZE = 0x200000
 FLASH_SIZE = 0x100000
@@ -58,7 +62,12 @@ class Machine:
 
         if periph_ram:
             mu.mem_map(PERIPH_BASE, PERIPH_SIZE)
-        mu.mem_map(RAM_BASE, RAM_SIZE)
+        mu.mem_map(RAM_PAGE, RAM_TOP - RAM_PAGE)
+        self._hole_hook = mu.hook_add(
+            UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE | UC_HOOK_MEM_FETCH,
+            lambda mu, access, addr, size, value, ud:
+                (_ for _ in ()).throw(MemoryError(f"access to unimplemented SRAM at 0x{addr:X}")),
+            begin=RAM_PAGE, end=RAM_BASE - 1)
         mu.mem_map(RETURN_SENTINEL, SENTINEL_SIZE)
 
         self.reset_registers()
