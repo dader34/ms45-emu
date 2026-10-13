@@ -100,6 +100,7 @@ from ms45emu.inputs import set_pedal          # noqa: E402
 from ms45emu.sci import SCC1R0, CLOCK         # noqa: E402
 
 SLICE_SECONDS = 0.0025   # DME time between looks at the line
+P3_CATCH_UP_SECONDS = 0.05   # the most DME time made up before a request is heard (P3min is 12 ms)
 PTY_ACTIVE_SECONDS = 120
 RESET_ANSWER = bytes.fromhex("B8F11201510B")   # positive response to STEUERGERAETE_RESET (11 01)
 TURBO_ANSWER_SECONDS = 0.1   # --turbo: DME time to wait for an answer to start (some requests get none)
@@ -340,7 +341,8 @@ class WebSocket:
             if path.startswith("/ignition"):
                 body, kind = self._ignition_page(path), b"text/html"
             elif path.startswith(("/rpm/", "/pedal/")):
-                _, what, value = path.rstrip("/").split("/")[:3]
+                # "/rpm/" with nothing after it must not take the bridge down
+                what, _, value = path.strip("/").partition("/")
                 try:
                     self.commands.append((what, float(value)))
                     body, kind = f"{what} {float(value):g}\n".encode(), b"text/plain"
@@ -849,6 +851,7 @@ def main():
     stdin_open = True
     epoch = (time.time(), board.instructions)      # real time and DME time, taken together
     in_flight = False                  # --turbo: a tester telegram is going in or its answer coming out
+    said = None                        # (wall time, DME instructions) when the DME's last bytes went out
     # --watch: the wall-clock side of every exchange, for a tester that times
     # out on the line: when the request came in, how long the DME took to
     # start answering, and any stretch where this loop itself did not get
@@ -868,8 +871,9 @@ def main():
 
     def reset_board(why):
         """A new board on what the flash and the EEPROM hold now, started from the reset vector."""
-        nonlocal board, epoch, in_flight, off_at, parked, fold_spin
+        nonlocal board, epoch, in_flight, off_at, parked, fold_spin, said
         board = board.reset()
+        said = None
         board.ignition(ignition)
         board.sci.on_tx = lambda byte: out.append((byte, dme_baud(board)))
         state = "its program" if board.cpu.program else "the boot loader: nothing valid to run"
@@ -930,6 +934,21 @@ def main():
                             line.write(data)                  # the cable's echo
                         if not powered or wrong_rate(line, dme_baud(board)):
                             continue                          # nobody there, or the DME hears noise, not bytes
+                        # The DME drops a request that comes less than 12 ms
+                        # after its own answer (P3min, as the car does). The
+                        # tester waits that out on the wall clock; when the
+                        # DME has fallen behind it, those milliseconds have
+                        # not passed here yet, and a request sent in good
+                        # time looks early and goes unanswered (a tester
+                        # polling several times a second lost one in ten or
+                        # so, each a two-second timeout). So before the DME
+                        # hears it, it is given the time the tester gave it.
+                        if said is not None:
+                            owed = (min(time.time() - said[0], P3_CATCH_UP_SECONDS)
+                                    - (board.instructions - said[1]) / board.ips)
+                            if owed > 0:
+                                board.run(int(owed * board.ips))
+                            said = None
                         board.sci.send(data)
                         if watch:
                             asked_at = time.time()
@@ -1025,6 +1044,7 @@ def main():
                             line.write(heard)
                 if trace:
                     trace.add("dme", sending, board.instructions / board.ips)
+                said = (time.time(), board.instructions)
                 sent = (sent + sending)[-len(RESET_ANSWER):]
                 if in_flight:
                     answer += sending

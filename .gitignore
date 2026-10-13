@@ -11,3 +11,7 @@ ms45emu.egg-info/
 .claude/
 # vendor datasheets referenced by docs, kept local only
 docs/*.pdf
+
+# Notes and write-ups stay local; the README is the one that is published.
+*.md
+!README.md

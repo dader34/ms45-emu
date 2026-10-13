@@ -157,7 +157,8 @@ class Crank:
         self.m = board.tpu_b.base + PARAM + MATCH_CHANNEL * 0x10
         self.cisr_a, self.cisr_b = board.tpu_a.base + CISR, board.tpu_b.base + CISR
         self._rpm = 0.0
-        self._origin = (0, 0.0)           # (instruction count, tooth position then)
+        self._origin = (0, 0.0)           # (instruction count, the wheel's own position then)
+        self._offset = 0.0                # the program's tooth numbering, ahead of the wheel's
         self.teeth_seen = 0               # since the search began
         self.searching = False            # initialised, no tooth reported yet
         self.next_tooth = None            # instruction count of the next tooth while not synchronised
@@ -179,7 +180,7 @@ class Crank:
     @rpm.setter
     def rpm(self, rpm):
         now = self.b.instructions
-        self._origin = (now, self.position(now))
+        self._origin = (now, self.wheel(now))
         was, self._rpm = self._rpm, float(rpm)
         if self._rpm > 0:
             self.stall_at = None
@@ -196,13 +197,31 @@ class Crank:
         """One tooth position: 60 to a revolution, so 1/rpm of a second."""
         return self.b.ips / self._rpm
 
-    def position(self, now=None):
-        """Tooth position in the cycle, 0 <= position < 120, with fraction."""
+    def wheel(self, now=None):
+        """Where the wheel itself is: tooth positions from its gap, over the
+        two revolutions of a cycle, 0 <= wheel < 120, with fraction. The gap
+        goes by at 0 and at 60 whatever the program calls those teeth."""
         at, pos = self._origin
         if self._rpm <= 0:
             return pos
         now = self.b.instructions if now is None else now
         return (pos + (now - at) / self.tooth_instructions) % TEETH_PER_CYCLE
+
+    def position(self, now=None):
+        """Tooth position as the program numbers it, 0 <= position < 120,
+        with fraction: the wheel's own, moved on by the number the program
+        gave the tooth after the gap.
+
+        The two are kept apart because the program does not call the tooth
+        after the gap 0 (it writes 25), and it restarts the search for the
+        gap every 10 ms as a matter of course. When the gap was looked for
+        in the program's numbering it was found 25 teeth from where the
+        program had last named it, the program named it again, and every
+        angle it had armed was suddenly 25 teeth off: between about 3100
+        and 5500 rpm, where the restarts and the wheel fell that way,
+        engine speed read anything from a third of the truth to its
+        ceiling."""
+        return (self.wheel(now) + self._offset) % TEETH_PER_CYCLE
 
     # ---- channel A13: the crank input ----------------------------------------
     @property
@@ -221,7 +240,14 @@ class Crank:
     def _write_tooth(self, addr, size, value):
         """The program names the tooth the wheel is at (after the gap)."""
         if size == 2:
-            self._origin = (self.b.instructions, float(value % TEETH_PER_CYCLE))
+            # The gap goes by twice a cycle and the program gives the tooth
+            # after it the same number both times: which revolution of the
+            # cycle this is, it keeps for itself. So the name moves the
+            # numbering only within the revolution, never by a whole one --
+            # that would put every angle it has armed 60 teeth away.
+            want = (value - self.wheel()) % TEETH_PER_REV
+            turn = round((self._offset - want) / TEETH_PER_REV)
+            self._offset = (want + turn * TEETH_PER_REV) % TEETH_PER_CYCLE
             if self.state == STATE_GAP:
                 self.next_tooth = None
                 self._report(STATE_SYNCED)
@@ -270,7 +296,7 @@ class Crank:
             if self.searching:
                 self.searching = False
                 self._report(STATE_TEETH)
-            elif self.state == STATE_TEETH and self.teeth_seen >= 3 and int(self.position()) % TEETH_PER_REV == 0:
+            elif self.state == STATE_TEETH and self.teeth_seen >= 3 and int(self.wheel()) % TEETH_PER_REV == 0:
                 self._report(STATE_GAP)           # the long tooth: the gap has gone by
         if self.match_at is not None and now >= self.match_at:
             time = int(self.match_at / self.b.ips * MATCH_HZ) & 0x7FFFFF
@@ -346,8 +372,9 @@ class Coils:
     def service(self):
         crank = self.b.crank
         slot = self._slot(crank.position())
-        was, self._seen = self._seen, (crank._origin, slot)
-        if was is None or was[0] != crank._origin:        # the wheel was moved under us: start again from here
+        frame = (crank._origin, crank._offset)
+        was, self._seen = self._seen, (frame, slot)
+        if was is None or was[0] != frame:                # the wheel was moved under us: start again from here
             return
         slots = TEETH_PER_CYCLE // SPARK_SPACING
         for k in range(1, (slot - was[1]) % slots + 1):
