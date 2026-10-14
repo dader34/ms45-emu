@@ -19,14 +19,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ms45emu import dme, overlay, transport                # noqa: E402
 from ms45emu.board import Board                            # noqa: E402
-from ms45emu.e46 import Peers                              # noqa: E402
-from ms45emu.image import IMAGES_DIR, Pair                 # noqa: E402
-from ms45emu.inputs import set_pedal                       # noqa: E402
+from ms45emu.e46 import running                            # noqa: E402
+from ms45emu.image import load_named                       # noqa: E402
 from ms45emu.kwp import Tester                             # noqa: E402
 from ms45emu.xref import Xref                              # noqa: E402
 
 TABLE, LENGTH = 0x52F9, 0x208      # the hottest table of the milestone-1 profile
-RAM_LO, RAM_LEN = 0x3F9800, 0x4800
 
 
 def main():
@@ -34,18 +32,13 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seconds", type=float, default=0.2, metavar="RUN",
                     help="seconds of engine run per phase (default 0.2)")
-    ap.add_argument("--table", type=lambda s: int(s, 0), default=TABLE)
+    ap.add_argument("--table", type=lambda s: int(s, 0), default=TABLE, metavar="OFFSET",
+                    help=f"calibration offset of the table to tune (default 0x{TABLE:X})")
     args = ap.parse_args()
     table, length = args.table, LENGTH
 
-    with open(os.path.join(IMAGES_DIR, "session1.flash.bin"), "rb") as f, \
-         open(os.path.join(IMAGES_DIR, "session1.mpc.bin"), "rb") as m:
-        pair = Pair(f.read(), m.read(), "session1")
-    b = Board(transport.build(overlay.build(pair)))
-    b.boot(max_insns=int(0.2 * b.ips))
-    peers = Peers(b, automatic=True)
-    set_pedal(b, 15)
-    b.crank.rpm = 900
+    b = Board(transport.build(overlay.build(load_named("session1"))))
+    peers = running(b)
     t = Tester(b)
 
     flash_range = (dme.CAL_BASE + table, dme.CAL_BASE + table + length)
@@ -67,14 +60,7 @@ def main():
     print(f"  2C 6C 02 wrote {length} bytes across {round(length / 0x40)} requests")
     peers.run(int(args.seconds * b.ips))
 
-    readers = {}
-    for (pc, kind), s in x.sites.items():
-        if kind != "R":
-            continue
-        hit = any(flash_range[0] <= a < flash_range[1] for a in s.addrs)
-        mir = any(mirror <= a < mirror + length for a in s.addrs)
-        if hit or mir:
-            readers[pc] = (s.count, hit, mir)
+    readers = x.touched(flash_range, (mirror, mirror + length))
     relocated = sum(c for c, _, mir in readers.values() if mir)
     stayed = sum(c for c, hit, _ in readers.values() if hit)
     print(f"  readers of the table: {relocated} reads from the mirror, {stayed} from flash")
@@ -84,8 +70,7 @@ def main():
 
     transport.close_all(t)
     peers.run(int(args.seconds * b.ips))
-    after = sum(1 for (pc, kind), s in x.sites.items()
-                if kind == "R" and any(mirror <= a < mirror + length for a in s.addrs))
+    after = len(x.touched((mirror, mirror + length)))
     print(f"  2C 6C 03 closed: {after} reads from the mirror since")
     print("\nverdict:", "live tuning over the K line works"
           if relocated and n else "INCOMPLETE")

@@ -9,6 +9,7 @@ Payload layouts are the published E46 ones where known; everything else is
 zeros, which the DME takes as "nothing requested".
 """
 from .board import Board
+from .inputs import set_pedal
 
 # DME transmit
 DME1, DME2, DME3, DME4 = 0x316, 0x329, 0x338, 0x545
@@ -66,3 +67,13 @@ class Peers:
                     b.can_a.receive(ident, self.data[ident])
                     self._due[ident] = b.instructions + period * frame // 10
             b.run(min(frame, end - b.instructions))
+
+
+def running(board, rpm=900, pedal=15, settle=0.2):
+    """Boot the board, let the OS settle, then hold the engine at `rpm` with
+    the pedal at `pedal` percent on a live bus: the Peers to run it with."""
+    board.boot(max_insns=int(settle * board.ips))
+    peers = Peers(board, automatic=True)
+    set_pedal(board, pedal)
+    board.crank.rpm = rpm
+    return peers

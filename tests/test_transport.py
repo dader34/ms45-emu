@@ -129,7 +129,7 @@ def test_out_of_cal_refused(t):
     transport.close_all(t)
 
 
-def test_twenty_one_tables_refused(t):
+def test_a_table_past_the_last_slot_refused(t):
     transport.close_all(t)
     for i in range(overlay.SLOTS):
         assert transport.open_table(t, CURVE + 16 * i, 16)

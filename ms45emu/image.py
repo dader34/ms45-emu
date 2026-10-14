@@ -78,6 +78,15 @@ def find_pair(kind="stock"):
     return None
 
 
+def load_named(flash="session1", mpc=None):
+    """A pair by name, images/<name>.flash.bin and .mpc.bin (session1 is the
+    car's own read-out), or from the two files given."""
+    if mpc is None:
+        flash, mpc = (os.path.join(IMAGES_DIR, f"{flash}.{part}.bin") for part in ("flash", "mpc"))
+    with open(flash, "rb") as f, open(mpc, "rb") as m:
+        return Pair(f.read(), m.read(), os.path.basename(flash).split(".")[0])
+
+
 def load_pair(kind="stock"):
     paths = find_pair(kind)
     if paths is None:

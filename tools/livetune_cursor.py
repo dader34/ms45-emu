@@ -52,7 +52,7 @@ from ms45emu import dme                                     # noqa: E402
 from ms45emu.board import Board                              # noqa: E402
 from ms45emu.e46 import Peers                                # noqa: E402
 from ms45emu.funcmap import FunctionMap                      # noqa: E402
-from ms45emu.image import IMAGES_DIR, Pair                   # noqa: E402
+from ms45emu.image import load_named                         # noqa: E402
 from ms45emu.inputs import set_pedal                         # noqa: E402
 from ms45emu.machine import R13                              # noqa: E402
 from ms45emu.overlay import LOOKUP_WRAPPERS                  # noqa: E402
@@ -226,10 +226,7 @@ def main():
                     metavar="OFFSET", help="print what was found for this table (repeatable)")
     args = ap.parse_args()
 
-    flash = args.flash or os.path.join(IMAGES_DIR, "session1.flash.bin")
-    mpc = args.mpc or os.path.join(IMAGES_DIR, "session1.mpc.bin")
-    with open(flash, "rb") as f, open(mpc, "rb") as m:
-        pair = Pair(f.read(), m.read(), os.path.basename(flash).split(".")[0])
+    pair = load_named(args.flash, args.mpc) if args.flash and args.mpc else load_named("session1")
     program = pair.program_id.decode("latin1")
     b = Board(pair)
     fmap = FunctionMap(pair)

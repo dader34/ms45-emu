@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ms45emu import fold, overlay, singles, transport      # noqa: E402
 from ms45emu.board import VALID_MARKS              # noqa: E402
 from ms45emu.checksums import fix_program          # noqa: E402
-from ms45emu.image import IMAGES_DIR, Pair         # noqa: E402
+from ms45emu.image import IMAGES_DIR, Pair, load_named   # noqa: E402
 
 PROGRAM_FILE = (0x60000, 0x100000)                 # the program's part of the external flash
 MAPS_FILE = 0xE0000                                # from here the old generation keeps its second map
@@ -47,8 +47,7 @@ def clean_base(pair, stock_flash, stock_mpc):
     owner's own and stays: on the car that is the immobiliser (EWS) delete, two
     instructions in ews_lock, without which the engine would not start.
     Returns (pair, [(offset, length)] of what was kept)."""
-    with open(stock_flash, "rb") as f, open(stock_mpc, "rb") as m:
-        stock = Pair(f.read(), m.read(), "stock")
+    stock = load_named(stock_flash, stock_mpc)
     if stock.program_id != pair.program_id:
         raise ValueError(f"the stock pair is program {stock.program_id!r}, the source {pair.program_id!r}")
     if overlay.carries_old(stock):
@@ -77,9 +76,7 @@ def clean_base(pair, stock_flash, stock_mpc):
 
 
 def build(source="session1", stock=None):
-    with open(os.path.join(IMAGES_DIR, f"{source}.flash.bin"), "rb") as f, \
-         open(os.path.join(IMAGES_DIR, f"{source}.mpc.bin"), "rb") as m:
-        pair = Pair(f.read(), m.read(), source)
+    pair = load_named(source)
     if stock:
         pair, _kept = clean_base(pair, *stock)
     return singles.build(fold.build(transport.build(overlay.build(pair))))
@@ -103,9 +100,7 @@ def main():
     if args.stock:
         print(f"built on the stock program: map-switch generation present = {overlay.carries_old(built)}")
         if args.base_prefix:
-            with open(os.path.join(IMAGES_DIR, f"{args.source}.flash.bin"), "rb") as f, \
-                 open(os.path.join(IMAGES_DIR, f"{args.source}.mpc.bin"), "rb") as m:
-                base, kept = clean_base(Pair(f.read(), m.read(), args.source), *args.stock)
+            base, kept = clean_base(load_named(args.source), *args.stock)
             for at, n in kept:
                 print(f"kept from the source's program: {n} bytes at 0x{at:X} ({base.flash[at:at + n].hex()})")
             with open(args.base_prefix + ".flash.bin", "wb") as f:

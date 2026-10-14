@@ -45,13 +45,13 @@ from collections import namedtuple
 
 from . import dme, overlay
 from .checksums import fix_program
-from .diagpatch import BEQ, BNE, BLT, _branch, _d
-from .fold import (_Fold, _add, _addi, _addis, _andi, _cmplwi, _cmpwi, _lbz, _lhz, _li, _lis, _lwz,
-                   _mflr, _mfctr, _mtctr, _mtlr, _mr, _ori, _rlwinm, _srwi, _stw, BLR)
 from .funcmap import FunctionMap
 from .image import Pair
+from .ppc import (BEQ, BNE, BLT, BLR, RFI, R13, Asm, _branch, _d, _add, _addi, _addis, _cmplwi,
+                  _cmpwi, _lbz, _lhz, _lis, _lwz, _mflr, _mfctr, _mtctr, _mtlr, _mr, _ori,
+                  _rlwinm, _srwi, _stw, _mfspr, _mtspr, _mfcr, _mtcr, _extsh, _ba)
 
-R13, R2 = 0x4017F0, 0xFFE47FF0
+R2 = 0xFFE47FF0
 EXT = 0xFFF00000
 MPC_CODE = (0x100, 0x6E550)             # the program's two halves: the internal flash below
 EXT_CODE = (0x60000, 0xDC854)           # the old generation's stubs, the external above the loader
@@ -73,18 +73,9 @@ TWI = 3
 S_CR, S_CTR, S_WORD = (overlay.STATE + at - R13 for at in (0x10, 0x14, 0x18))   # the handler's
                                         # three words, spare in the transport's state block
 SRR0, SRR1, SPRG0, SPRG1, SPRG2 = 26, 27, 272, 273, 274   # the program uses SPRG3 only
-RFI = 0x4C000064
 
 Site = namedtuple("Site", "pc op rd offset")            # offset: of the calibration
 Plan = namedtuple("Plan", "sites skipped ranges pool runs")
-
-
-def _mfspr(rt, n): return (31 << 26) | (rt << 21) | ((n & 31) << 16) | ((n >> 5) << 11) | (339 << 1)
-def _mtspr(n, rs): return (31 << 26) | (rs << 21) | ((n & 31) << 16) | ((n >> 5) << 11) | (467 << 1)
-def _mfcr(rt): return (31 << 26) | (rt << 21) | (19 << 1)
-def _mtcr(rs): return (31 << 26) | (rs << 21) | (0xFF << 12) | (144 << 1)
-def _extsh(ra, rs): return (31 << 26) | (rs << 21) | (ra << 16) | (922 << 1)
-def _ba(target): return (18 << 26) | (target & 0x03FFFFFC) | 2
 
 
 def _file(pc):
@@ -232,7 +223,7 @@ def parse_table(data):
 def _code(stock):
     """The fill, the reset hook and the trap handler, assembled at CODE:
     (bytes, labels). `stock` is the program's own program-exception handler."""
-    a = _Fold(EXT + CODE)
+    a = Asm(EXT + CODE)
     e = a.emit
 
     # ---- fill: the pool from the calibration. r5-r10, r0, CTR; returns ----

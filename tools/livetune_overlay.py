@@ -19,10 +19,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ms45emu import dme, overlay                         # noqa: E402
 from ms45emu.board import Board                          # noqa: E402
-from ms45emu.e46 import Peers                            # noqa: E402
+from ms45emu.e46 import running                          # noqa: E402
 from ms45emu.funcmap import FunctionMap                  # noqa: E402
-from ms45emu.image import IMAGES_DIR, Pair               # noqa: E402
-from ms45emu.inputs import set_pedal                     # noqa: E402
+from ms45emu.image import load_named                     # noqa: E402
 from ms45emu.xref import Xref                            # noqa: E402
 
 TABLE, LENGTH = 0x52F9, 0x208      # the hottest table of the milestone-1 profile
@@ -30,15 +29,10 @@ RAM_LO, RAM_LEN = 0x3F9800, 0x4800
 
 
 def run(edit, table, length, pre, post):
-    with open(os.path.join(IMAGES_DIR, "session1.flash.bin"), "rb") as f, \
-         open(os.path.join(IMAGES_DIR, "session1.mpc.bin"), "rb") as m:
-        pair = Pair(f.read(), m.read(), "session1")
+    pair = load_named("session1")
     b = Board(overlay.build(pair))
     fmap = FunctionMap(pair)
-    b.boot(max_insns=int(0.2 * b.ips))
-    peers = Peers(b, automatic=True)
-    set_pedal(b, 15)
-    b.crank.rpm = 900
+    peers = running(b)
     flash_range = (dme.CAL_BASE + table, dme.CAL_BASE + table + length)
     ((_, _, mirror),) = overlay.placement([(table, length)])   # where install will put it
     x = Xref(b, [flash_range, (mirror, mirror + length)])
@@ -51,14 +45,8 @@ def run(edit, table, length, pre, post):
         b.m.write(mirror, bytes(data))
     peers.run(int(post * b.ips))                     # after: reads from the mirror
 
-    readers = {}
-    for (pc, kind), s in x.sites.items():
-        if kind != "R":
-            continue
-        touched_flash = any(flash_range[0] <= a < flash_range[1] for a in s.addrs)
-        touched_mirror = any(mirror <= a < mirror + length for a in s.addrs)
-        if touched_flash or touched_mirror:
-            readers[fmap.label(pc)] = (s.count, touched_flash, touched_mirror)
+    readers = {fmap.label(pc): hit
+               for pc, hit in x.touched(flash_range, (mirror, mirror + length)).items()}
     state = (b.m.sda16(dme.VAR_N), b.m.read8(0x3F9C43))
     return readers, b.m.read(RAM_LO, RAM_LEN), state
 
@@ -68,9 +56,10 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seconds", type=float, default=0.15, metavar="POST",
                     help="seconds after the mirror is installed (default 0.15)")
-    ap.add_argument("--table", default=lambda: None)   # placeholder, unused
+    ap.add_argument("--table", type=lambda s: int(s, 0), default=TABLE, metavar="OFFSET",
+                    help=f"calibration offset of the table to mirror (default 0x{TABLE:X})")
     args = ap.parse_args()
-    table, length, pre = TABLE, LENGTH, 0.1
+    table, length, pre = args.table, LENGTH, 0.1
 
     readers, ram, state = run(False, table, length, pre, args.seconds)
     print(f"unedited run: N={state[0]}, engine_state={state[1]:#04x}")

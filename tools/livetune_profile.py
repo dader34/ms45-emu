@@ -35,7 +35,7 @@ from ms45emu import dme                                     # noqa: E402
 from ms45emu.board import Board                              # noqa: E402
 from ms45emu.e46 import Peers                                # noqa: E402
 from ms45emu.funcmap import FunctionMap                      # noqa: E402
-from ms45emu.image import IMAGES_DIR, Pair, load_pair        # noqa: E402
+from ms45emu.image import load_named, load_pair              # noqa: E402
 from ms45emu.inputs import set_pedal                         # noqa: E402
 from ms45emu.xref import Xref                                # noqa: E402
 
@@ -89,14 +89,11 @@ def main():
     args = ap.parse_args()
 
     if args.flash and args.mpc:
-        with open(args.flash, "rb") as f, open(args.mpc, "rb") as m:
-            pair = Pair(f.read(), m.read(), os.path.basename(args.flash).split(".")[0])
+        pair = load_named(args.flash, args.mpc)
     elif args.pair:
         pair = load_pair(args.pair)
     else:
-        with open(os.path.join(IMAGES_DIR, "session1.flash.bin"), "rb") as f, \
-             open(os.path.join(IMAGES_DIR, "session1.mpc.bin"), "rb") as m:
-            pair = Pair(f.read(), m.read(), "session1")
+        pair = load_named("session1")
 
     b = Board(pair)
     fmap = FunctionMap(pair)

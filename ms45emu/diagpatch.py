@@ -35,6 +35,7 @@ from . import dme
 from .checksums import fix_program
 from .image import Pair
 from .machine import R13
+from .ppc import BEQ, BNE, BLT, BGT, Asm, _branch, _branch_target, _d, _x   # noqa: F401  (re-exported)
 
 Field = namedtuple("Field", "name address size")
 
@@ -66,46 +67,14 @@ CAN_A_MB15 = 0x3071F0
 MB_TX_INACTIVE, MB_TX_ONCE = 0x80, 0xC0
 
 
-# ---- a little PowerPC -------------------------------------------------------
-def _d(op, rt, ra, imm):
-    assert -0x8000 <= imm <= 0xFFFF, hex(imm)
-    return (op << 26) | (rt << 21) | (ra << 16) | (imm & 0xFFFF)
-
-
-def _x(rt, ra, rb, xo):
-    return (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (xo << 1)
-
-
-def _branch(frm, to, link=False):
-    d = (to - frm) & 0xFFFFFFFF                 # addresses wrap: MPC code at 0 reaches 0xFFFxxxxx
-    assert d < 0x02000000 or d >= 0xFE000000, (hex(frm), hex(to))
-    return (18 << 26) | (d & 0x03FFFFFC) | (1 if link else 0)
-
-
-def _branch_target(at, word):
-    li = word & 0x03FFFFFC
-    if li & 0x02000000:
-        li -= 0x04000000
-    return (at + li) & 0xFFFFFFFF
-
-
+# ---- a little PowerPC (the words are ppc.py's) ------------------------------
 LOAD, STORE = {1: 34, 2: 40, 4: 32}, {1: 38, 2: 44, 4: 36}
 R0, R11, R12, R13_ = 0, 11, 12, 13
-BEQ, BNE, BLT, BGT = (12, 2), (4, 2), (12, 0), (12, 1)
 
 
-class _Asm:
-    def __init__(self, base):
-        self.base, self.items, self.labels = base, [], {}
-
-    def here(self):
-        return self.base + 4 * len(self.items)
-
-    def label(self, name):
-        self.labels[name] = self.here()
-
-    def emit(self, *words):
-        self.items.extend(words)
+class _Asm(Asm):
+    """The shared assembler, its conditional branch placed as it is called
+    (the stubs here are written straight through), plus the field moves."""
 
     def bc(self, cond, name):
         self.items.append((cond, name))
@@ -133,14 +102,6 @@ class _Asm:
         self.emit(_d(32, R11, R13_, dme.HEAP_TOP), _d(14, R12, R13_, BLOCK + BLOCK_SIZE - R13), _x(0, R11, R12, 32))
         self.bc(BLT, out)
 
-    def bytes(self):
-        out = []
-        for i, it in enumerate(self.items):
-            if not isinstance(it, int):
-                (bo, bi), target = it[0], self.labels[it[1]]
-                it = (16 << 26) | (bo << 21) | (bi << 16) | ((target - self.base - 4 * i) & 0xFFFC)
-            out.append(it)
-        return struct.pack(f">{len(out)}I", *out)
 
 
 def _frame_stub(base, can_id, can_fields):

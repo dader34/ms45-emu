@@ -229,6 +229,18 @@ class Xref:
                 return saved
         return lr
 
+    def touched(self, *spans, kind="R"):
+        """The sites of a kind that reached any of the spans [(start, end)]:
+        {pc: (count, whether the site touched each span, ...)}."""
+        out = {}
+        for (pc, k), site in self.sites.items():
+            if k != kind:
+                continue
+            hits = tuple(any(lo <= a < hi for a in site.addrs) for lo, hi in spans)
+            if any(hits):
+                out[pc] = (site.count,) + hits
+        return out
+
     def report(self):
         out = []
         for start, end in self.ranges:

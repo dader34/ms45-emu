@@ -24,10 +24,10 @@ import struct
 
 from . import dme
 from .checksums import fix_program
-from .diagpatch import BEQ, BNE, BLT, _branch, _d, _x
 from .image import Pair
+from .ppc import (BEQ, BNE, BLT, BGE, BCTR, R13, Asm, _branch, _btarget, _d, _mr, _mtctr,
+                  _rlwinm, _x)
 
-R13 = 0x4017F0
 OLD_BASE, OLD_STRIDE = 0x6E550, 0x24       # the old generation's sixteen stubs
 CODE, CODE_END = 0x6E904, 0x6F400          # our stubs. 0x6F400+ is the boot-PoC
                                            # payload's transient slot, used only
@@ -65,7 +65,8 @@ SHELF = (0x1D000, 0x1FF80)                 # calibration offsets: the sector's b
                                            # here instead (transport op 06): blank flash takes
                                            # a word without an erase, and every save erases
                                            # the sector, so the shelf empties itself
-SCAN = CODE + 4                            # the shared descriptor scan (see _emit_scan)
+SCAN = CODE + 4                            # the shared descriptor scan (see _emit_scan); the
+                                           # word before it moves r3 to r12 for the entry hooks
 MAGIC = 0x6C690000                         # "li": lis alone builds it, so one
                                            # instruction still buys a 32-bit check
 ENTRY_WORDS = 3                            # base, end, delta
@@ -110,87 +111,8 @@ def _wrap_lwz(reg, disp):
     return (32 << 26) | (reg << 21) | (3 << 16) | (disp & 0xFFFF)
 
 
-def _rlwinm(rs, ra, sh, mb, me):
-    # M-form: the bits-6-10 field is the SOURCE (rs), bits 11-15 the DEST (ra).
-    return (21 << 26) | (rs << 21) | (ra << 16) | (sh << 11) | (mb << 6) | (me << 1)
-
-
 def _word(mpc, at):
     return struct.unpack_from(">I", mpc, at)[0]
-
-
-def _btarget(at, word):
-    """Where a plain `b` at `at` goes, or None if the word is not one."""
-    if word >> 26 != 18 or word & 1:
-        return None
-    li = word & 0x03FFFFFC
-    if li & 0x02000000:
-        li -= 0x04000000
-    return (at + li) & 0xFFFFFFFF
-
-
-class _Asm:
-    """The diagnostic patch's assembler, plus an unconditional branch to a
-    label (its `bc` tuples resolved the same way)."""
-
-    def __init__(self, base):
-        self.base, self.items, self.labels = base, [], {}
-
-    def here(self):
-        return self.base + 4 * len(self.items)
-
-    def label(self, name):
-        self.labels[name] = self.here()
-
-    def emit(self, *words):
-        self.items.extend(words)
-
-    def b(self, name):
-        return ("b", name)
-
-    def bc(self, cond, name):
-        return (cond, name)
-
-    def lis_lbl(self, rd, name):
-        """lis rd, HI16(&name) -- the label's absolute address, resolved late."""
-        return ("lis", rd, name)
-
-    def ori_lbl(self, rd, name):
-        """ori rd, rd, LO16(&name) -- pairs with lis_lbl for a 32-bit address."""
-        return ("ori", rd, name)
-
-    def bytes(self):
-        out = []
-        for i, it in enumerate(self.items):
-            if isinstance(it, int):
-                out.append(it)
-                continue
-            at = self.base + 4 * i
-            if it[0] == "b":
-                out.append(_branch(at, self.labels[it[1]]))
-            elif it[0] == "lis":
-                _, rd, name = it
-                # a label just above an address boundary needs the +0x8000 carry
-                # the ori's signed add undoes; our tail is far from any such edge
-                out.append((15 << 26) | (rd << 21) | ((self.labels[name] >> 16) & 0xFFFF))
-            elif it[0] == "ori":
-                _, rd, name = it
-                out.append((24 << 26) | (rd << 21) | (rd << 16) | (self.labels[name] & 0xFFFF))
-            else:
-                (bo, bi), target = it[0], self.labels[it[1]]
-                out.append((16 << 26) | (bo << 21) | (bi << 16) | ((target - at) & 0xFFFC))
-        return struct.pack(f">{len(out)}I", *out)
-
-
-_BCTR = (19 << 26) | (20 << 21) | (528 << 1)                    # bctr
-
-
-def _mtctr(rs):
-    return (31 << 26) | (rs << 21) | (9 << 16) | (467 << 1)     # mtspr CTR, rs
-
-
-def _mr(rd, rs):
-    return (31 << 26) | (rs << 21) | (rd << 16) | (rs << 11) | (444 << 1)   # or rd,rs,rs
 
 
 def _emit_scan(a):
@@ -200,11 +122,14 @@ def _emit_scan(a):
     added in place; otherwise r12 is left untouched. The bitmap is consulted
     first: most lookups are of tables nobody opened, and they leave after a
     dozen instructions however many descriptors there are. The caller puts its return
-    address in CTR (so r11/r12/r0 stay free here) and branches to 'scan'; scan
-    returns with `bctr`. Registers: r12 the pointer, r11 the descriptor cursor,
-    r0 scratch, CTR the return, cr0 -- all in the stubs' free set. The magic
-    gate reads only the high half (MAGIC's low half is zero and no live pointer
-    is 0x6C69xxxx), so one `cmplwi` suffices without a second scratch."""
+    address in CTR (so r11/r12/r0 stay free here) and branches to 'scan', or to
+    'scan_r3' just before it with the pointer still in r3; scan returns with
+    `bctr`. Registers: r12 the pointer, r11 the descriptor cursor, r0 scratch,
+    CTR the return, cr0 -- all in the stubs' free set. The magic gate reads
+    only the high half (MAGIC's low half is zero and no live pointer is
+    0x6C69xxxx), so one `cmplwi` suffices without a second scratch."""
+    a.label("scan_r3")
+    a.emit(_mr(12, 3))
     a.label("scan")
     a.emit(_d(32, 0, 13, DESC - R13),                        # lwz r0, magic
            _rlwinm(0, 0, 16, 16, 31),                        # srwi r0, r0, 16
@@ -214,7 +139,7 @@ def _emit_scan(a):
            _d(15, 11, 12, -(dme.CAL_BASE >> 16) & 0xFFFF),   # addis r11, r12, -CAL: the offset
            _rlwinm(11, 11, 32 - BLOCK_SHIFT, BLOCK_SHIFT, 31),  # srwi r11, r11, 8: the block
            _d(10, 0, 11, BLOCKS), a.bc(BGE, "scan_ret"),     # cmplwi r11, BLOCKS
-           _rlwinm(11, 0, 0, 29, 31),                        # r0 = block & 7
+           _rlwinm(0, 11, 0, 29, 31),                        # r0 = block & 7
            _rlwinm(11, 11, 29, 3, 31),                       # srwi r11, r11, 3
            _x(11, 11, 13, 266),                              # add r11, r11, r13
            _d(34, 11, 11, BITMAP - R13),                     # lbz r11, bitmap byte
@@ -232,7 +157,7 @@ def _emit_scan(a):
     a.label("scan_next")
     a.emit(_d(14, 11, 11, ENTRY_WORDS * 4), a.b("scan_loop"))
     a.label("scan_ret")
-    a.emit(_BCTR)
+    a.emit(BCTR)
     return a
 
 
@@ -244,7 +169,7 @@ def _emit_entry(a, i, entry, stock, old=True):
     a.label(f"entry{i}")
     cont = f"entry{i}_ret"
     a.emit(a.lis_lbl(0, cont), a.ori_lbl(0, cont), _mtctr(0),  # CTR = &continuation
-           _mr(12, 3), a.b("scan"))                            # r12 = r3; redirect
+           a.b("scan_r3"))                                     # r12 = r3; redirect
     a.label(cont)
     a.emit(_mr(3, 12))                                         # r3 = redirected pointer
     if old:
@@ -252,7 +177,7 @@ def _emit_entry(a, i, entry, stock, old=True):
         # pointer ending in 0x7FF2 (r2+2) move by +0xA0000.
         a.emit(_d(34, 0, 13, dme.RAM_FLAG - R13),                 # lbz r0, flag
                _d(28, 0, 0, 1), a.bc(BEQ, f"entry{i}_stock"),     # andi. r0, r0, 1
-               _rlwinm(3, 0, 15, 17, 31),                         # r0 = r3 & 0xFFFF
+               _rlwinm(0, 3, 15, 17, 31),                         # r0 = r3 & 0xFFFF
                _d(10, 0, 0, 0x7FF2), a.bc(BNE, f"entry{i}_stock"),  # cmplwi
                _d(15, 3, 3, 0xA))                                 # addis r3, r3, 0xA
     a.label(f"entry{i}_stock")
@@ -260,14 +185,15 @@ def _emit_entry(a, i, entry, stock, old=True):
 
 
 def _emit_wrap(a, i, pc, reg, disp):
-    """One library-wrapper hook (replacing `lwz rReg, disp(r3)`). Run the load,
-    then redirect rReg through the shared scan so the wrapper's own reads fall
-    in the mirror, then back to the instruction after the one we displaced."""
+    """One library-wrapper hook (replacing `lwz rReg, disp(r3)`). Run the load
+    into r12 (the scan's own register, clobbered here either way), redirect it
+    through the shared scan so the wrapper's own reads fall in the mirror, then
+    hand it to rReg and go back to the instruction after the one we displaced."""
     a.label(f"wrap{i}")
     cont = f"wrap{i}_ret"
-    a.emit(_wrap_lwz(reg, disp),                             # lwz rReg, disp(r3)
+    a.emit(_wrap_lwz(12, disp),                              # lwz r12, disp(r3)
            a.lis_lbl(0, cont), a.ori_lbl(0, cont), _mtctr(0),  # CTR = &continuation
-           _mr(12, reg), a.b("scan"))                         # r12 = rReg; redirect
+           a.b("scan"))                                      # redirect
     a.label(cont)
     a.emit(_mr(reg, 12), _branch(a.here() + 4, pc + 4))       # rReg = redirected; back
 
@@ -289,12 +215,13 @@ def carries_old(pair):
 
 def _build_tail(code, old=True):
     """Assemble the whole tail at `code` in one unit: the shared scan
-    subroutine, then the sixteen entry hooks, then the twenty wrapper hooks.
-    Returns (bytes, entry_targets, wrap_targets) -- the absolute address each
-    hooked site must branch to."""
-    a = _Asm(code)
-    a.emit(a.b("scan"))                                      # skip over the subroutine
-    _emit_scan(a)
+    subroutine, then the sixteen entry hooks, then the twenty-eight wrapper
+    hooks. Returns (bytes, entry_targets, wrap_targets) -- the absolute address
+    each hooked site must branch to."""
+    a = Asm(code)
+    _emit_scan(a)                                            # nothing falls into it: every
+    assert a.labels["scan"] == SCAN                          # hook branches to a label
+
     entry_targets, wrap_targets = [], []
     for i, (entry, stock) in enumerate(zip(dme.LOOKUP_ENTRIES, LOOKUP_STOCK)):
         entry_targets.append(a.here())
@@ -307,7 +234,7 @@ def _build_tail(code, old=True):
 
 def build(pair, code=CODE):
     """The pair with the overlay hooks, re-signed. Hooks both the sixteen
-    lookup-entry stubs (redirecting the r3 table pointer) and the twenty
+    lookup-entry stubs (redirecting the r3 table pointer) and the twenty-eight
     library wrappers that read through a 4(r3) data pointer the entry hooks
     never see. On the car's program the old generation's stubs are there and
     their redirect is kept; on BMW's own program (no map switch) the entries

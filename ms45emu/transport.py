@@ -5,7 +5,7 @@ The stock handler (entry 0xFFF6FC60, ext file 0x6FC60 — traced 2026-10-11)
 accepts only local id 0xF0; anything else it answers `7F 2C 12` and stores
 nothing. `build` replaces its first instruction (`stwu r1, -0x20(r1)`) with
 a branch to a stub in blank ext space: the stub sees local id 0x6C, runs one
-of five ops against the overlay's descriptor table and mirror pools, and
+of seven ops against the overlay's descriptor table and mirror pools, and
 falls through to the stock body, whose `7F 2C 12` becomes the ack. The
 response/TX path is boot-sector code and is never touched.
 
@@ -34,8 +34,8 @@ Request layout (the received telegram's data, in SRAM):
 The tester decides where every mirror lives (op 07 only checks that it is
 inside a pool or the shelf), so RAM is its to manage: a table being edited
 sits in RAM, one that is not can be programmed onto the shelf with op 06
-and re-placed there, which frees its RAM for the next table. Twenty tables
-can be open; the shelf holds 12 KB between two saves.
+and re-placed there, which frees its RAM for the next table. Thirty-six
+tables (overlay.SLOTS) can be open; the shelf holds 12 KB between two saves.
 
 The state block at 0x3F9E74 (r13-reachable, in the span the KWP writer map
 proved quiet) carries the magic, the last op's status, the open count, the
@@ -55,11 +55,11 @@ import struct
 
 from . import dme, overlay
 from .checksums import fix_program
-from .diagpatch import BEQ, BNE, BLT, BGT, _branch, _d, _x
 from .image import Pair
-from .overlay import _Asm                       # the diagpatch assembler + `b` to label
+from .ppc import (BEQ, BNE, BLT, BGT, BGE, BLE, BDNZ, R13, Asm, _branch, _btarget, _d, _x, _li, _lis,
+                  _ori, _addi, _addis, _lwz, _lhz, _lbz, _stw, _cmpwi, _cmplwi, _cmplw, _add, _or, _mr,
+                  _mflr, _mtlr, _mtctr, _rlwinm, _slwi, _srwi)
 
-R13 = 0x4017F0
 HANDLER = 0xFFF6FC60               # the 2C define-packet handler's entry
 HFILE = HANDLER - 0xFFF00000       # the same word as an ext file offset
 STOCK_FIRST = 0x9421FFE0           # stwu r1, -0x20(r1)
@@ -102,9 +102,6 @@ P_OFF, P_LEN, P_MIRROR = ARG1 + 1, ARG1 + 4, ARG1 + 6
 from .fold import ENTRY as SAVE_ENTRY, SHELF as SHELF_ENTRY   # noqa: E402
 from . import fold, singles                                   # noqa: E402
 
-BGE = (4, 0)                       # branch if cr0.LT clear  (>=)
-BLE = (4, 1)                       # branch if cr0.GT clear  (<=)
-
 
 def _r13(addr):
     off = addr - R13
@@ -112,39 +109,8 @@ def _r13(addr):
     return off
 
 
-def _cmpwi(ra, imm):
-    return (11 << 26) | (ra << 16) | (imm & 0xFFFF)
-
-
-def _lis(rd, hi):
-    return _d(15, rd, 0, hi)
-
-
-def _slwi16(rd):
-    # slwi rd, rd, 16  == rlwinm rd, rd, 16, 0, 15
-    return (21 << 26) | (rd << 21) | (rd << 16) | (16 << 11) | (0 << 6) | (15 << 1)
-
-
-def _mtctr(r):
-    # mtspr's SPR field is split: bits 16-20 carry SPR[0:4], bits 11-15
-    # SPR[5:9] — with 9 in the wrong half it writes SPR 288 (a no-op here,
-    # which left CTR at its ambient value and turned every copy loop into
-    # a 2^32-iteration walk through the map)
-    return (31 << 26) | (r << 21) | ((9 & 31) << 16) | ((9 >> 5) << 11) | (467 << 1)
-
-
-def _btarget(at, word):
-    """Where a plain `b` at `at` goes, or None if the word is not one."""
-    if word >> 26 != 18 or word & 1:
-        return None
-    li = word & 0x03FFFFFC
-    if li & 0x02000000:
-        li -= 0x04000000
-    return (at + li) & 0xFFFFFFFF
-
-
 def _stub(base):
-    a = _Asm(base)
+    a = Asm(base)
     e = a.emit
     desc = _r13(overlay.DESC)
 
@@ -204,7 +170,7 @@ def _stub(base):
     e(_d(14, 11, 13, _r13(PAYLOAD)))                           # r11 = source
     a.label("wcopy")
     e(_d(34, 0, 11, 0), _d(38, 0, 12, 0))
-    e(_d(14, 11, 11, 1), _d(14, 12, 12, 1), a.bc((16, 0), "wcopy"))
+    e(_d(14, 11, 11, 1), _d(14, 12, 12, 1), a.bc(BDNZ, "wcopy"))
     a.label("w_done")
     e(_d(14, 0, 0, STATUS_OK), a.b("finish"))
 
@@ -221,13 +187,13 @@ def _stub(base):
       _x(0, 12, 0, 0), a.bc(BNE, "closed"))
     e(_d(37, 1, 1, -0x30))                                     # stwu r1, -0x30(r1)
     for i, r in enumerate(range(5, 11)):
-        e(fold._stw(r, 8 + 4 * i, 1))
-    e(fold._mflr(0), fold._stw(0, 0x24, 1))
+        e(_stw(r, 8 + 4 * i, 1))
+    e(_mflr(0), _stw(0, 0x24, 1))
     e(_branch(a.here(), 0xFFF00000 + singles.FILL, link=True))
-    e(fold._lwz(0, 0x24, 1), fold._mtlr(0))
+    e(_lwz(0, 0x24, 1), _mtlr(0))
     for i, r in enumerate(range(5, 11)):
-        e(fold._lwz(r, 8 + 4 * i, 1))
-    e(fold._addi(1, 1, 0x30))
+        e(_lwz(r, 8 + 4 * i, 1))
+    e(_addi(1, 1, 0x30))
     a.label("closed")
     e(_d(14, 0, 0, STATUS_OK), a.b("finish"))
 
@@ -271,67 +237,66 @@ def _stub(base):
     # ---- 07 place: a slot's descriptor, its mirror where the tester says ---
     # r3 slot, r4 count, r5 the range's base, r6 its length, r7 its end as a
     # calibration offset, r8 the mirror, r11 the descriptor.
-    f = fold
     a.label("place")
     e(_d(37, 1, 1, -0x30))                                     # stwu r1, -0x30(r1)
     for i, r in enumerate(range(3, 11)):
-        e(f._stw(r, 8 + 4 * i, 1))
-    e(f._lbz(3, _r13(ARG1), 13), f._lwz(4, _r13(STATE) + S_COUNT, 13))
-    e(f._li(0, STATUS_SLOT), f._cmplw(3, 4), a.bc(BGT, "place_out"))
-    e(f._li(0, STATUS_FULL), f._cmplwi(3, overlay.SLOTS), a.bc(BGE, "place_out"))
-    e(f._lbz(5, _r13(P_OFF), 13), f._slwi(5, 5, 16), f._lhz(0, _r13(P_OFF) + 1, 13), f._or(5, 5, 0))
-    e(f._lhz(6, _r13(P_LEN), 13))
-    e(f._li(0, STATUS_RANGE), f._cmpwi(6, 0), a.bc(BEQ, "place_out"))
-    e(f._add(7, 5, 6), f._lis(12, dme.CAL_LENGTH >> 16), f._ori(12, 12, dme.CAL_LENGTH & 0xFFFF))
-    e(f._cmplw(7, 12), a.bc(BGT, "place_out"))
-    e(f._lbz(8, _r13(P_MIRROR), 13), f._slwi(8, 8, 16), f._lhz(0, _r13(P_MIRROR) + 1, 13), f._or(8, 8, 0))
-    e(f._add(9, 8, 6))                                         # r9 = the mirror's end
-    e(f._li(0, STATUS_ROOM))
+        e(_stw(r, 8 + 4 * i, 1))
+    e(_lbz(3, _r13(ARG1), 13), _lwz(4, _r13(STATE) + S_COUNT, 13))
+    e(_li(0, STATUS_SLOT), _cmplw(3, 4), a.bc(BGT, "place_out"))
+    e(_li(0, STATUS_FULL), _cmplwi(3, overlay.SLOTS), a.bc(BGE, "place_out"))
+    e(_lbz(5, _r13(P_OFF), 13), _slwi(5, 5, 16), _lhz(0, _r13(P_OFF) + 1, 13), _or(5, 5, 0))
+    e(_lhz(6, _r13(P_LEN), 13))
+    e(_li(0, STATUS_RANGE), _cmpwi(6, 0), a.bc(BEQ, "place_out"))
+    e(_add(7, 5, 6), _lis(12, dme.CAL_LENGTH >> 16), _ori(12, 12, dme.CAL_LENGTH & 0xFFFF))
+    e(_cmplw(7, 12), a.bc(BGT, "place_out"))
+    e(_lbz(8, _r13(P_MIRROR), 13), _slwi(8, 8, 16), _lhz(0, _r13(P_MIRROR) + 1, 13), _or(8, 8, 0))
+    e(_add(9, 8, 6))                                         # r9 = the mirror's end
+    e(_li(0, STATUS_ROOM))
     for lo, hi in overlay.POOLS + (overlay.SINGLES_POOL,):     # inside one RAM pool?
-        e(f._addi(12, 13, _r13(lo)), f._cmplw(8, 12), a.bc(BLT, f"not{lo:X}"))
-        e(f._addi(12, 13, _r13(hi)), f._cmplw(9, 12), a.bc(BLE, "place_ram"))
+        e(_addi(12, 13, _r13(lo)), _cmplw(8, 12), a.bc(BLT, f"not{lo:X}"))
+        e(_addi(12, 13, _r13(hi)), _cmplw(9, 12), a.bc(BLE, "place_ram"))
         a.label(f"not{lo:X}")
     lo, hi = overlay.SHELF                                     # or on the shelf?
-    e(f._lis(12, lo >> 16), f._ori(12, 12, lo & 0xFFFF), f._cmplw(8, 12), a.bc(BLT, "place_out"))
-    e(f._lis(12, hi >> 16), f._ori(12, 12, hi & 0xFFFF), f._cmplw(9, 12), a.bc(BGT, "place_out"))
-    e(f._addis(8, 8, dme.CAL_BASE >> 16), f._li(10, 0), a.b("place_have"))
+    e(_lis(12, lo >> 16), _ori(12, 12, lo & 0xFFFF), _cmplw(8, 12), a.bc(BLT, "place_out"))
+    e(_lis(12, hi >> 16), _ori(12, 12, hi & 0xFFFF), _cmplw(9, 12), a.bc(BGT, "place_out"))
+    e(_addis(8, 8, dme.CAL_BASE >> 16), _li(10, 0), a.b("place_have"))
     a.label("place_ram")
-    e(f._li(10, 1))
+    e(_li(10, 1))
     a.label("place_have")
-    e(f._addis(5, 5, dme.CAL_BASE >> 16))                      # r5 = the base address
-    e(_d(7, 11, 3, 12), f._addi(11, 11, desc + 4), f._add(11, 11, 13))   # r11 = &desc[slot]
+    e(_addis(5, 5, dme.CAL_BASE >> 16))                      # r5 = the base address
+    e(_d(7, 11, 3, 12), _addi(11, 11, desc + 4), _add(11, 11, 13))   # r11 = &desc[slot]
     # a mirror in RAM is seeded from where the range reads now: the slot's
     # present mirror when it already serves this range, else the calibration
-    e(f._cmpwi(10, 0), a.bc(BEQ, "place_seeded"), f._mr(9, 5))
-    e(f._cmplw(3, 4), a.bc(BGE, "place_seed"))
-    e(f._lwz(0, 0, 11), f._cmplw(0, 5), a.bc(BNE, "place_seed"))
-    e(f._lwz(0, 8, 11), f._add(9, 5, 0), f._cmplw(9, 8), a.bc(BEQ, "place_seeded"))
+    e(_cmpwi(10, 0), a.bc(BEQ, "place_seeded"), _mr(9, 5))
+    e(_cmplw(3, 4), a.bc(BGE, "place_seed"))
+    e(_lwz(0, 0, 11), _cmplw(0, 5), a.bc(BNE, "place_seed"))
+    e(_lwz(0, 8, 11), _add(9, 5, 0), _cmplw(9, 8), a.bc(BEQ, "place_seeded"))
     a.label("place_seed")
-    e(_mtctr(6), f._mr(12, 8))
+    e(_mtctr(6), _mr(12, 8))
     a.label("place_copy")
-    e(f._lbz(0, 0, 9), _d(38, 0, 12, 0), f._addi(9, 9, 1), f._addi(12, 12, 1), a.bc((16, 0), "place_copy"))
+    e(_lbz(0, 0, 9), _d(38, 0, 12, 0), _addi(9, 9, 1), _addi(12, 12, 1), a.bc(BDNZ, "place_copy"))
     a.label("place_seeded")
-    e(f._stw(8, _r13(STATE) + S_MIRROR, 13))
-    e(f._stw(5, 0, 11), f._add(0, 5, 6), f._stw(0, 4, 11))     # base, end
-    e(_x(0, 5, 8, 40), f._stw(0, 8, 11))                       # delta = mirror - base
+    e(_stw(8, _r13(STATE) + S_MIRROR, 13))
+    e(_stw(5, 0, 11), _add(0, 5, 6), _stw(0, 4, 11))     # base, end
+    e(_x(0, 5, 8, 40), _stw(0, 8, 11))                       # delta = mirror - base
     # the range's blocks in the bitmap
-    e(f._addis(9, 5, -(dme.CAL_BASE >> 16) & 0xFFFF), f._srwi(9, 9, overlay.BLOCK_SHIFT),
-      f._addi(7, 7, -1), f._srwi(7, 7, overlay.BLOCK_SHIFT), f._li(6, 1))
+    e(_addis(9, 5, -(dme.CAL_BASE >> 16) & 0xFFFF), _srwi(9, 9, overlay.BLOCK_SHIFT),
+      _addi(7, 7, -1), _srwi(7, 7, overlay.BLOCK_SHIFT), _li(6, 1))
     a.label("place_bit")
-    e(f._srwi(12, 9, 3), f._add(12, 12, 13), f._lbz(0, _r13(overlay.BITMAP), 12),
-      f._rlwinm(10, 9, 0, 29, 31), _x(6, 10, 10, 24), f._or(0, 0, 10),
+    e(_srwi(12, 9, 3), _add(12, 12, 13), _lbz(0, _r13(overlay.BITMAP), 12),
+      _rlwinm(10, 9, 0, 29, 31), _x(6, 10, 10, 24), _or(0, 0, 10),
       _d(38, 0, 12, _r13(overlay.BITMAP)),
-      f._addi(9, 9, 1), f._cmplw(9, 7), a.bc(BLE, "place_bit"))
-    e(f._cmplw(3, 4), a.bc(BNE, "place_counted"))               # a new slot: the null base
-    e(f._li(0, 0), f._stw(0, 12, 11), f._addi(4, 4, 1),        # after it, and the count
-      f._stw(4, _r13(STATE) + S_COUNT, 13))
+      _addi(9, 9, 1), _cmplw(9, 7), a.bc(BLE, "place_bit"))
+    e(_cmplw(3, 4), a.bc(BNE, "place_counted"))               # a new slot: the null base
+    e(_li(0, 0), _stw(0, 12, 11), _addi(4, 4, 1),        # after it, and the count
+      _stw(4, _r13(STATE) + S_COUNT, 13))
     a.label("place_counted")
-    e(f._lis(0, overlay.MAGIC >> 16), f._stw(0, desc, 13))
-    e(f._li(0, STATUS_OK))
+    e(_lis(0, overlay.MAGIC >> 16), _stw(0, desc, 13))
+    e(_li(0, STATUS_OK))
     a.label("place_out")
     for i, r in enumerate(range(3, 11)):
-        e(f._lwz(r, 8 + 4 * i, 1))
-    e(f._addi(1, 1, 0x30))
+        e(_lwz(r, 8 + 4 * i, 1))
+    e(_addi(1, 1, 0x30))
 
     a.label("finish")
     e(_d(36, 0, 13, _r13(STATE) + S_STATUS))

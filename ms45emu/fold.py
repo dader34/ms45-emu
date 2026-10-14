@@ -45,11 +45,13 @@ import struct
 
 from . import dme, overlay
 from .checksums import crc32_mpeg2, fix_program
-from .diagpatch import BEQ, BNE, BLT, BGT, _branch, _branch_target, _d, _x
 from .image import Pair
-from .overlay import _Asm
+from .ppc import (BEQ, BNE, BLT, BGT, BGE, BDNZ, ISYNC, BLR, BCTR, BEQLR, R13, Asm,
+                  _branch, _branch_target, _d, _li, _lis, _ori, _addi, _addis, _andi, _lwz, _lhz,
+                  _lbz, _stw, _sth, _cmpwi, _cmplwi, _cmplw, _add, _or, _xor, _mr, _addc, _addze,
+                  _srw, _mflr, _mtlr, _mfctr, _mtctr, _mfmsr, _mtmsr, _mfbbcmcr, _mtbbcmcr,
+                  _rlwinm, _slwi, _srwi)
 
-R13 = 0x4017F0
 CHIP = 0xFFE00000                       # the external chip's first window
 CAL = dme.CAL_BASE                      # 0xFFE40000, the calibration sector
 CAL_FILE, SECTOR = 0x40000, 0x20000
@@ -87,56 +89,6 @@ REQUEST = 0x3F9A47                      # the shelf request's arguments (transpo
                                         # calibration offset (3), byte count, the bytes
 FRAME = 0x30
 SHELF_FRAME = 0x40
-BGE, BLE = (4, 0), (4, 1)
-BDNZ = (16, 0)
-ISYNC, BLR, BCTR, BEQLR = 0x4C00012C, 0x4E800020, 0x4E800420, 0x4D820020
-
-
-def _li(rt, v): return _d(14, rt, 0, v)
-def _lis(rt, v): return _d(15, rt, 0, v)
-def _ori(ra, rs, v): return _d(24, rs, ra, v)
-def _addi(rt, ra, v): return _d(14, rt, ra, v)
-def _addis(rt, ra, v): return _d(15, rt, ra, v)
-def _andi(ra, rs, v): return _d(28, rs, ra, v)          # andi. (sets cr0)
-def _lwz(rt, d, ra): return _d(32, rt, ra, d)
-def _lhz(rt, d, ra): return _d(40, rt, ra, d)
-def _lbz(rt, d, ra): return _d(34, rt, ra, d)
-def _stw(rs, d, ra): return _d(36, rs, ra, d)
-def _sth(rs, d, ra): return _d(44, rs, ra, d)
-def _cmpwi(ra, v): return _d(11, 0, ra, v)
-def _cmplwi(ra, v): return _d(10, 0, ra, v)
-def _cmplw(ra, rb): return _x(0, ra, rb, 32)
-def _add(rt, ra, rb): return _x(rt, ra, rb, 266)
-def _or(ra, rs, rb): return _x(rs, ra, rb, 444)
-def _xor(ra, rs, rb): return _x(rs, ra, rb, 316)
-def _mr(ra, rs): return _or(ra, rs, rs)
-def _addc(rt, ra, rb): return _x(rt, ra, rb, 10)
-def _addze(rt, ra): return (31 << 26) | (rt << 21) | (ra << 16) | (202 << 1)
-def _srw(ra, rs, rb): return _x(rs, ra, rb, 536)
-def _mflr(rt): return (31 << 26) | (rt << 21) | (8 << 16) | (339 << 1)
-def _mtlr(rs): return (31 << 26) | (rs << 21) | (8 << 16) | (467 << 1)
-def _mfctr(rt): return (31 << 26) | (rt << 21) | (9 << 16) | (339 << 1)
-
-
-def _rlwinm(ra, rs, sh, mb, me):
-    return (21 << 26) | (rs << 21) | (ra << 16) | (sh << 11) | (mb << 6) | (me << 1)
-
-
-def _slwi(ra, rs, n): return _rlwinm(ra, rs, n, 0, 31 - n)
-def _srwi(ra, rs, n): return _rlwinm(ra, rs, 32 - n, n, 31)
-def _mtctr(rs): return (31 << 26) | (rs << 21) | (9 << 16) | (467 << 1)
-def _mfmsr(rt): return (31 << 26) | (rt << 21) | (83 << 1)
-def _mtmsr(rs): return (31 << 26) | (rs << 21) | (146 << 1)
-def _mfbbcmcr(rt): return (31 << 26) | (rt << 21) | (16 << 16) | (17 << 11) | (339 << 1)   # SPR 560
-def _mtbbcmcr(rs): return (31 << 26) | (rs << 21) | (16 << 16) | (17 << 11) | (467 << 1)
-
-
-class _Fold(_Asm):
-    def bl(self, name):
-        self.emit(_branch(self.here(), self.labels[name], link=True))
-
-    def far(self, target):
-        self.emit(_branch(self.here(), target))
 
 
 def _watchdog(e, base, scratch=0):
@@ -201,7 +153,7 @@ def _burst_on(a, tag, br0, bbcmcr):
 
 def _code(base):
     """The whole of it, assembled at `base`: (bytes, labels)."""
-    a = _Fold(base)
+    a = Asm(base)
     e = a.emit
 
     # ---- the after-run's way in: our return is the displaced call ---------
