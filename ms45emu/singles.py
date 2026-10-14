@@ -4,9 +4,9 @@ through the live-tune mirrors like the tables do.
 
 A table goes through the lookup library, which the overlay hooks. A single
 value does not: it is one `lbz/lhz/lha/lwz rD, d(r2)` somewhere in the
-program, 4,300 of them for 2,900 values, and r2 never moves. Two things are
-done to those instructions, by how often the value is read (measured on the
-emulator, ms45emu/names/<program>.singles.json):
+program, 4,300 of them for 2,900 values, and r2 never moves. Two things can
+be done to those instructions, by how often the value is read (measured on
+the emulator, ms45emu/names/<program>.singles.json):
 
 - **Read often** (some 540 values, 800 bytes, 97% of the reads): the value
   gets a byte or two of RAM for good, in the pool at the top of the heap, and
@@ -30,6 +30,14 @@ emulator, ms45emu/names/<program>.singles.json):
 A table in the external flash says which is which, for the tester: the pool
 entries, and the runs of calibration bytes every reader of which is patched
 (a value outside them takes effect after a save, as before).
+
+**The trap tier is off by default (`build(traps=False)`) since 2026-10-14:
+on the car it reset the DME every time the revs passed 3,100-3,400 rpm at
+60 % load. The reset came from outside the program (no self-reset record),
+so a timing budget was exceeded: the idle profile never saw the paths a
+firing engine runs there, and every one of their reads was a trap, some
+sixty instructions from external flash each. Without traps a value outside
+the pool is an after-save one, which the table says (no runs).**
 
 Not patched: instructions outside the function map (not known to be code),
 ones whose destination is r1, r2 or r13, and ones reachable with MSR[RI]
@@ -303,11 +311,12 @@ def trap_word(site):
     return (TWI << 26) | ((28 + KINDS[site.op]) << 21) | (site.rd << 16) | ((dme.CAL_BASE + site.offset - R2) & 0xFFFF)
 
 
-def build(pair, rates=None, threshold=THRESHOLD):
+def build(pair, rates=None, threshold=THRESHOLD, traps=False):
     """The pair with its single values live, re-signed. Composes last, after
     overlay.build, transport.build and fold.build. A pair already built is
     returned as it is: the re-pointed instructions no longer say where they
-    read."""
+    read. `traps` adds the trap tier for the values outside the pool, which
+    the car cannot afford (see the module doc): experiments only."""
     if is_patched(pair):
         return pair
     if not overlay.is_patched(pair):
@@ -325,6 +334,8 @@ def build(pair, rates=None, threshold=THRESHOLD):
         raise ValueError("the reset sequence does not end in the call to main this build displaces")
 
     p = plan(pair, rates, threshold)
+    if not traps:
+        p = Plan(p.sites, p.skipped, p.ranges, p.pool, [])   # nothing outside the pool is live
     data = table(p)
     code, labels = _code(stock)
     if TABLE + len(data) > CODE or CODE + len(code) > CODE_END:
@@ -335,6 +346,8 @@ def build(pair, rates=None, threshold=THRESHOLD):
         i = bisect.bisect_right(starts, s.offset) - 1
         home = starts[i] if i >= 0 and s.offset < starts[i] + p.pool[starts[i]][0] else None
         if home is None:
+            if not traps:
+                continue                                    # the load stays as it is
             word = trap_word(s)
         else:
             d = POOL[0] + p.pool[home][1] + (s.offset - home) - R13
@@ -345,6 +358,7 @@ def build(pair, rates=None, threshold=THRESHOLD):
     flash[TABLE:TABLE + len(data)] = data
     flash[CODE:CODE + len(code)] = code
     struct.pack_into(">I", flash, call, _branch(MAIN_CALL, labels["boot"], link=True))
-    struct.pack_into(">I", mpc, VECTOR, _ba(labels["handler"]))
+    if traps:
+        struct.pack_into(">I", mpc, VECTOR, _ba(labels["handler"]))
     fix_program(flash, mpc)
     return Pair(bytes(flash), bytes(mpc), pair.name + "+singles")

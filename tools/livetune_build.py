@@ -75,11 +75,11 @@ def clean_base(pair, stock_flash, stock_mpc):
             [(a, n) for a, n in kept if not sums(a)])
 
 
-def build(source="session1", stock=None):
+def build(source="session1", stock=None, traps=False):
     pair = load_named(source)
     if stock:
         pair, _kept = clean_base(pair, *stock)
-    return singles.build(fold.build(transport.build(overlay.build(pair))))
+    return singles.build(fold.build(transport.build(overlay.build(pair))), traps=traps)
 
 
 def main():
@@ -93,10 +93,12 @@ def main():
                     help="with --stock: also write the unpatched base pair here")
     ap.add_argument("--out-prefix", default=None,
                     help="output path prefix (default images/<source>.livetune)")
+    ap.add_argument("--traps", action="store_true",
+                    help="add the single-value trap tier (resets the car's DME at 3 krpm: experiments only)")
     args = ap.parse_args()
     prefix = args.out_prefix or os.path.join(IMAGES_DIR, f"{args.source}.livetune")
 
-    built = build(args.source, args.stock)
+    built = build(args.source, args.stock, args.traps)
     if args.stock:
         print(f"built on the stock program: map-switch generation present = {overlay.carries_old(built)}")
         if args.base_prefix:

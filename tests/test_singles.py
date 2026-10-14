@@ -43,7 +43,33 @@ def layers(stock):
 
 @pytest.fixture(scope="module")
 def built(layers):
-    return singles.build(layers)
+    # the trap tier is tested here although no image ships it any more:
+    # it resets the car's DME at 3 krpm (singles.py's module doc)
+    return singles.build(layers, traps=True)
+
+
+def test_default_build_has_no_traps(stock, layers, planned):
+    """What ships: the pool re-pointed, every other load untouched, the
+    program exception vector left alone, the table saying nothing outside
+    the pool is live."""
+    plain = singles.build(layers)
+    twi = lambda pair, image, span: sum(1 for at in range(*span, 4)   # noqa: E731
+                                        if struct.unpack_from(">I", getattr(pair, image), at)[0] >> 26 == singles.TWI)
+    for image, span in (("mpc", singles.MPC_CODE), ("flash", singles.EXT_CODE)):
+        assert twi(plain, image, span) == twi(stock, image, span), image
+    assert struct.unpack_from(">I", plain.mpc, singles.VECTOR)[0] == struct.unpack_from(">I", layers.mpc, singles.VECTOR)[0]
+    t = singles.parse_table(plain.flash[singles.TABLE:singles.TABLE + 0x2800])
+    assert t["runs"] == [] and len(t["pool"]) == len(planned.pool)
+    in_pool = lambda s: any(lo <= s.offset < lo + n for lo, (n, _) in planned.pool.items())   # noqa: E731
+    def word(pair, site):
+        image, at = singles._file(site.pc)
+        return struct.unpack_from(">I", pair.mpc if image == 0 else pair.flash, at)[0]
+    for s in planned.sites:
+        if in_pool(s):
+            assert (word(plain, s) >> 16) & 31 == 13, hex(s.pc)      # re-pointed to the pool
+        else:
+            assert word(plain, s) == word(layers, s), hex(s.pc)      # left as it was
+    assert singles.build(plain) is plain
 
 
 @pytest.fixture(scope="module")
