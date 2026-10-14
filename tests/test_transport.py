@@ -150,7 +150,7 @@ def test_full_ram_is_the_testers_to_see(t):
 def test_mirror_outside_the_pools_refused(t):
     transport.close_all(t)
     lo, hi = overlay.POOLS[1]
-    for mirror in (lo - 2, hi - 8, 0x3FA0A0, 0x3F9A44, overlay.SHELF[0] - 2, overlay.SHELF[1] - 8, 0x4395):
+    for mirror in (lo - 2, hi - 8, 0x3FA0A0, 0x3F9A44, 0x3F9B48, 0x3F9C00, overlay.SHELF[0] - 2, overlay.SHELF[1] - 8, 0x4395):
         assert transport.place(t, 0, CURVE, 16, mirror) == transport.STATUS_ROOM, hex(mirror)
     assert transport.place(t, 1, CURVE, 16, lo) == transport.STATUS_SLOT     # slot 0 comes first
     assert transport.read_state(t)["count"] == 0
