@@ -244,6 +244,14 @@ class Board:
         self.probe_counts = Counter()
         self.traps = 0
         m.mu.hook_add(UC_HOOK_INTR, self._intr)
+        # the live-tune transport's watch (op 09) needs the data breakpoint
+        self.breakpoint = None
+        if patch_program:
+            from . import transport
+            stub = transport.stub_base(pair)
+            if stub is not None:
+                from .watch import DataBreakpoint
+                self.breakpoint = DataBreakpoint(self, stub)
 
     # ---- probes -----------------------------------------------------------
     def probe(self, addr, name=None, on_hit=None):

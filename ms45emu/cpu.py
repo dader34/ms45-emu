@@ -21,6 +21,7 @@ MSR_EE = 0x8000
 # Vector table in the MPC's first 0x100 bytes: entry n at 8*n is `ba handler`.
 VECTOR_STRIDE = 8
 VEC_MACHINE_CHECK, VEC_EXTERNAL, VEC_PROGRAM, VEC_DECREMENTER, VEC_SYSCALL = 2, 5, 7, 9, 12
+VEC_DATA_BP = 0x1C
 SRR1_TRAP = 0x00020000         # a program exception raised by a trap instruction
 
 
@@ -273,6 +274,20 @@ class Cpu:
                 ]))
                 self.raise_stubs[(vector, ip)] = stub
 
+        # The data breakpoint (ms45emu/watch.py) is entered from a memory
+        # hook, in the middle of the load that tripped it: the registers the
+        # other stubs take SRR0/SRR1 in may be that load's rD, so this one
+        # takes them, and the register it borrows, from scratch+0x308..
+        self.bp_stub = SCRATCH + 0x1C0
+        ba = m.read32(VEC_DATA_BP * VECTOR_STRIDE)
+        if ba >> 26 == 18 and ba & 2:
+            m.write(self.bp_stub, _asm([
+                0x3D600010, 0x816B0308, 0x7D7A03A6,     # lis r11,0x10; lwz r11,0x308(r11); mtspr SRR0,r11
+                0x3D600010, 0x816B030C, 0x7D7B03A6,     # .. 0x30C .. mtspr SRR1,r11
+                0x3D600010, 0x816B0310,                 # r11 as it was
+                ba,                                                # ba handler
+            ]))
+
         # read DEC into r3, then stop (the caller runs until the nop after).
         self.read_dec_stub = SCRATCH + 0x100
         m.write(self.read_dec_stub, _asm([0x7C7602A6, 0x60000000]))        # mfspr r3,DEC ; nop
@@ -316,7 +331,19 @@ class Cpu:
         return bool(self.msr & MSR_EE)
 
     def in_stub(self, pc):
-        return SCRATCH <= pc < SCRATCH + 0x140 or MSR_STUB_BASE <= pc < MSR_STUB_BASE + MSR_STUB_SIZE
+        return SCRATCH <= pc < SCRATCH + 0x200 or MSR_STUB_BASE <= pc < MSR_STUB_BASE + MSR_STUB_SIZE
+
+    def enter_breakpoint(self, srr0):
+        """Enter the data breakpoint's vector with SRR0 = `srr0`, from inside
+        a memory hook: the access in flight completes first (the hardware
+        takes this exception after the instruction), then the stub runs."""
+        m = self.m
+        msr = self.msr
+        m.write32(self.saved_regs + 0x8, srr0)
+        m.write32(self.saved_regs + 0xC, msr)
+        m.write32(self.saved_regs + 0x10, m.reg(11))
+        m.mu.reg_write(UC_PPC_REG_MSR, msr & ~MSR_EE)
+        m.mu.reg_write(UC_PPC_REG_PC, self.bp_stub)
 
     def raise_exception(self, vector, srr1=0):
         """Enter the program's exception vector as the hardware would: SRR0 =

@@ -11,7 +11,7 @@ from unicorn.ppc_const import (UC_PPC_REG_0, UC_PPC_REG_CR, UC_PPC_REG_CTR, UC_P
 
 from ms45emu import dme, fold, overlay, singles, transport
 from ms45emu.board import Board
-from ms45emu.checksums import crc32_mpeg2
+from ms45emu.checksums import crc32_mpeg2, PROGRAM_CRC_RANGE
 from ms45emu.e46 import Peers
 from ms45emu.image import IMAGES_DIR, Pair
 from ms45emu.inputs import set_pedal
@@ -55,7 +55,9 @@ def test_default_build_has_no_traps(stock, layers, planned):
     plain = singles.build(layers)
     twi = lambda pair, image, span: sum(1 for at in range(*span, 4)   # noqa: E731
                                         if struct.unpack_from(">I", getattr(pair, image), at)[0] >> 26 == singles.TWI)
-    for image, span in (("mpc", singles.MPC_CODE), ("flash", singles.EXT_CODE)):
+    # (the flash count starts past the sums and the signature at 0x60000: a
+    # re-signed build has new bytes there, and a byte can look like a twi)
+    for image, span in (("mpc", singles.MPC_CODE), ("flash", (PROGRAM_CRC_RANGE[0], singles.EXT_CODE[1]))):
         assert twi(plain, image, span) == twi(stock, image, span), image
     assert struct.unpack_from(">I", plain.mpc, singles.VECTOR)[0] == struct.unpack_from(">I", layers.mpc, singles.VECTOR)[0]
     t = singles.parse_table(plain.flash[singles.TABLE:singles.TABLE + 0x2800])

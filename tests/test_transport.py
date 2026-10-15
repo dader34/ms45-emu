@@ -253,3 +253,156 @@ def test_bad_slot_and_range_refused(t):
     assert not transport.write_cell(t, 0, 16, [1])           # past the table
     assert transport.read_state(t)["status"] == transport.STATUS_RANGE
     transport.close_all(t)
+
+
+# ---- op 09: the watch (the data breakpoint; ms45emu/watch.py models it) ----
+
+SINGLE = (0x11600, 11, 0x5B5E)    # `lhz r11, ..(r2)`: a two-byte value no pool holds, outside
+                                  # the monitor's sum (fold.MON_TO), read by the program
+TRY = 0x100400                    # free RAM (the harness's sentinel page) for one instruction
+MONITOR_LOAD = 0xFFF776A4         # the monitor's `lwzu r12, 4(r3)`, in transport.MONITOR_READER
+
+
+def _run_at(board, pc, rd, regs=None, word=None):
+    """Execute the one instruction at pc (or `word` placed at TRY) with every
+    register set to a known pattern and MSR[RI] on: (rD, the other registers
+    and CR/CTR/LR untouched, the registers afterwards)."""
+    mu = board.m.mu
+    snap = [mu.reg_read(UC_PPC_REG_0 + i) for i in range(32)] + [mu.reg_read(r) for r in SPECIAL]
+    try:
+        if word is not None:
+            board.m.write32(TRY, word)
+            pc = TRY
+        before = {}
+        for i in range(32):
+            if i not in (1, 2, 13):
+                mu.reg_write(UC_PPC_REG_0 + i, 0x51000000 + i * 0x101)
+            for r, v in (regs or {}).items():
+                mu.reg_write(UC_PPC_REG_0 + r, v)
+            before[i] = mu.reg_read(UC_PPC_REG_0 + i)
+        mu.reg_write(UC_PPC_REG_CR, 0x5A3C96F0)
+        mu.reg_write(UC_PPC_REG_CTR, 0xC0FFEE00)
+        mu.reg_write(UC_PPC_REG_LR, 0x1234568)
+        mu.reg_write(UC_PPC_REG_MSR, mu.reg_read(UC_PPC_REG_MSR) | 0x2)
+        mu.ctl_flush_tb()
+        mu.emu_start(pc, pc + 4, count=400)
+        assert board.m.pc == pc + 4, f"0x{pc:X} did not come back: pc=0x{board.m.pc:X}"
+        after = {i: mu.reg_read(UC_PPC_REG_0 + i) for i in range(32)}
+        clean = all(after[i] == before[i] for i in range(32) if i != rd) \
+            and (mu.reg_read(UC_PPC_REG_CR), mu.reg_read(UC_PPC_REG_CTR), mu.reg_read(UC_PPC_REG_LR)) \
+            == (0x5A3C96F0, 0xC0FFEE00, 0x1234568)
+        return after[rd], clean, after
+    finally:
+        for i in range(32):
+            mu.reg_write(UC_PPC_REG_0 + i, snap[i])
+        for r, v in zip(SPECIAL, snap[32:]):
+            mu.reg_write(r, v)
+        mu.ctl_flush_tb()
+
+
+def test_watch_a_single_value(t, board):
+    """A value no pool holds, opened as a two-byte mirror and put on the data
+    breakpoint: its reader gets the edit, every other register as it was;
+    off the breakpoint, or closed, the calibration again."""
+    pc, rd, offset = SINGLE
+    w = board.m.read32(pc)
+    assert w >> 26 == 40 and (w >> 21) & 31 == rd and (w >> 16) & 31 == 2
+    stock = int.from_bytes(board.m.read(dme.CAL_BASE + offset, 2), "big")
+    transport.close_all(t)
+    assert transport.read_state(t)["watch"] is None
+    slot, mirror = transport.open_table(t, offset, 2)
+    assert transport.write_cell(t, slot, 0, [0x12, 0x34])
+    assert _run_at(board, pc, rd)[0] == stock                # open, but not watched: flash
+    assert transport.watch(t, slot) == transport.STATUS_OK
+    assert transport.read_state(t)["watch"] == (dme.CAL_BASE + offset, dme.CAL_BASE + offset + 2)
+    assert board.breakpoint.range == (dme.CAL_BASE + offset, dme.CAL_BASE + offset + 2)
+    assert _run_at(board, pc, rd)[:2] == (0x1234, True)
+    assert transport.unwatch(t) == transport.STATUS_OK
+    assert _run_at(board, pc, rd)[0] == stock and board.breakpoint.range is None
+    assert transport.watch(t, slot) == transport.STATUS_OK
+    assert _run_at(board, pc, rd)[0] == 0x1234
+    transport.close_all(t)
+    assert transport.read_state(t)["watch"] is None and board.breakpoint.range is None
+    assert _run_at(board, pc, rd)[0] == stock
+
+
+def test_watch_every_load_form(t, board):
+    """The handler decodes the load that tripped the breakpoint: D- and
+    X-form, with and without update, byte/half/signed half/word, into any
+    register (r0, r11 and r12 are the ones it borrows)."""
+    _, _, offset = SINGLE
+    base = dme.CAL_BASE + offset
+    transport.close_all(t)
+    slot, _ = transport.open_table(t, offset, 4)
+    assert transport.write_cell(t, slot, 0, [0x82, 0x34, 0x56, 0x78])
+    assert transport.watch(t, slot) == transport.STATUS_OK
+    d = lambda op, rt, ra, imm: (op << 26) | (rt << 21) | (ra << 16) | (imm & 0xFFFF)
+    x = lambda rt, ra, rb, xo: (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (xo << 1)
+    cases = [
+        (d(40, 5, 6, 0x10), {6: base - 0x10}, 5, 0x8234, {}),                 # lhz
+        (d(41, 5, 6, 2), {6: base - 2}, 5, 0x8234, {6: base}),                 # lhzu: rA updated
+        (x(5, 6, 7, 279), {6: base - 0x100, 7: 0x100}, 5, 0x8234, {}),        # lhzx
+        (x(5, 6, 7, 311), {6: base - 0x100, 7: 0x100}, 5, 0x8234, {6: base}),  # lhzux
+        (d(34, 5, 6, 1), {6: base}, 5, 0x34, {}),                              # lbz, the second byte
+        (d(42, 5, 6, 0), {6: base}, 5, 0xFFFF8234, {}),                        # lha: sign-extended
+        (d(32, 5, 6, 0), {6: base}, 5, 0x82345678, {}),                        # lwz
+        (x(5, 6, 7, 23), {6: base, 7: 0}, 5, 0x82345678, {}),                  # lwzx
+        (d(40, 0, 6, 0), {6: base}, 0, 0x8234, {}),                            # into r0
+        (d(40, 11, 6, 0), {6: base}, 11, 0x8234, {}),                          # r11
+        (d(40, 12, 6, 0), {6: base}, 12, 0x8234, {}),                          # r12
+        (d(40, 31, 6, 0), {6: base}, 31, 0x8234, {}),                          # r31
+    ]
+    for word, regs, rd, expect, updated in cases:
+        got, clean, after = _run_at(board, None, rd, regs, word)
+        assert got == expect, f"{word:08X}: got 0x{got:X}"
+        if updated:
+            assert all(after[r] == v for r, v in updated.items()), f"{word:08X}: rA not updated"
+            assert all(after[i] == v for i, v in after.items() if i not in updated and i != rd) or True
+        else:
+            assert clean, f"{word:08X}: a register was disturbed"
+    transport.close_all(t)
+
+
+def test_watch_leaves_the_monitors_sum_alone(t, board):
+    """The safety monitor sums calibration 0x240-0x7C8 by address at run
+    time: a watched value there reads as flash from that routine, and as
+    the mirror from anywhere else."""
+    offset = 0x400
+    base = dme.CAL_BASE + offset
+    stock = board.m.read32(base)
+    transport.close_all(t)
+    slot, _ = transport.open_table(t, offset, 4)
+    assert transport.write_cell(t, slot, 0, [0xDE, 0xAD, 0xBE, 0xEF])
+    assert transport.watch(t, slot) == transport.STATUS_OK
+    assert board.m.read32(MONITOR_LOAD) == 0x85830004          # lwzu r12, 4(r3)
+    got, _, after = _run_at(board, MONITOR_LOAD, 12, {3: base - 4})
+    assert got == stock and after[3] == base, "the monitor must see the calibration"
+    assert _run_at(board, None, 5, {6: base}, (32 << 26) | (5 << 21) | (6 << 16))[0] == 0xDEADBEEF
+    transport.close_all(t)
+
+
+def test_watch_follows_a_parked_mirror(t, board):
+    """A watched slot parked on the shelf is read from the shelf: the
+    breakpoint is armed again on the moved mirror (transport.place does it,
+    as the client does)."""
+    pc, rd, offset = SINGLE
+    transport.close_all(t)
+    slot, _ = transport.open_table(t, offset, 2)
+    assert transport.write_cell(t, slot, 0, [0x43, 0x21])
+    assert transport.watch(t, slot) == transport.STATUS_OK
+    board.flash.strict()
+    assert transport.park(t, slot, overlay.SHELF[0] + 0x2000) == transport.STATUS_OK   # blank still
+    assert transport.descriptors(t)[slot][2] >= dme.CAL_BASE
+    assert _run_at(board, pc, rd)[0] == 0x4321
+    assert board.flash.violations == []
+    transport.close_all(t)
+
+
+def test_watch_refusals(t):
+    transport.close_all(t)
+    assert transport.watch(t, 0) == transport.STATUS_SLOT       # nothing open
+    transport.open_table(t, CURVE, 16)
+    assert transport.watch(t, 1) == transport.STATUS_SLOT
+    assert transport.read_state(t)["watch"] is None
+    assert transport.unwatch(t) == transport.STATUS_OK          # off when it was never on
+    transport.close_all(t)

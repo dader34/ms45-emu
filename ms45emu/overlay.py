@@ -46,8 +46,8 @@ SAVE_ARMED = BITMAP + 58                   # one of the bitmap space's two spare
 SAVE_ASKED = 0x5A                          # here and the key-off folds the open tables in
                                            # (transport op 08); anything else and the edits
                                            # go with the power, as nobody asked to keep them
-STATE = 0x3F9E74                           # the transport's 0x24-byte state block
-POOLS = ((0x3F9E98, 0x3FA0A0),             # RAM for mirrors, the other never-written gaps
+STATE = 0x3F9E74                           # the transport's 0x30-byte state block
+POOLS = ((0x3F9EA4, 0x3FA0A0),             # RAM for mirrors, the other never-written gaps
          (0x3F9E10, 0x3F9E74),             # (milestone-1 profile and the KWP writer map: the
          (BITMAP + BITMAP_SPACE, 0x3F98B0))  # receive interrupt and its response echo write
                                            # 0x3F983C-50 and 0x3F99DC-0x3F9A64, none of it

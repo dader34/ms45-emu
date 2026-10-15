@@ -56,9 +56,10 @@ import struct
 from . import dme, overlay
 from .checksums import fix_program
 from .image import Pair
-from .ppc import (BEQ, BNE, BLT, BGT, BGE, BLE, BDNZ, R13, Asm, _branch, _btarget, _d, _x, _li, _lis,
-                  _ori, _addi, _addis, _lwz, _lhz, _lbz, _stw, _cmpwi, _cmplwi, _cmplw, _add, _or, _mr,
-                  _mflr, _mtlr, _mtctr, _rlwinm, _slwi, _srwi)
+from .ppc import (BEQ, BNE, BLT, BGT, BGE, BLE, BDNZ, BCTR, RFI, ISYNC, R13, Asm, _branch, _btarget,
+                  _d, _x, _li, _lis, _ori, _addi, _addis, _lwz, _lhz, _lbz, _stw, _cmpwi, _cmplwi,
+                  _cmplw, _add, _or, _mr, _mflr, _mtlr, _mtctr, _mfctr, _mfcr, _mtcr, _mfspr, _mtspr,
+                  _rlwinm, _slwi, _srwi, _ba)
 
 HANDLER = 0xFFF6FC60               # the 2C define-packet handler's entry
 HFILE = HANDLER - 0xFFF00000       # the same word as an ext file offset
@@ -78,13 +79,37 @@ LOCAL_ID = 0x6C
 ACK = bytes((0x7F, 0x2C, 0x12))    # what the stock body answers for our id
 
 S_MAGIC, S_STATUS, S_COUNT, S_VERSION, S_MIRROR, S_MSR = 0, 4, 8, 0x0C, 0x1C, 0x20
-S_SIZE = 0x24
-VERSION = 5                        # 2: ops 06 and 07, no op 01 (version 1 kept a pool
+W_BASE, W_END, W_DELTA = 0x24, 0x28, 0x2C   # the watched slot's descriptor, as armed (op 09)
+S_SIZE = 0x30                      # (0x10-0x18 are the exception handlers' scratch words)
+VERSION = 6                        # 2: ops 06 and 07, no op 01 (version 1 kept a pool
                                    # cursor, a RAM address, in this word). 3: the
                                    # descriptors moved and grew, single values are
                                    # live (singles.py). 4: the key-off saves only
                                    # when asked (op 08). 5: a save keeps the safety
-                                   # monitor's sum in step (fold.MON_AT)
+                                   # monitor's sum in step (fold.MON_AT). 6: op 09
+                                   # watches one slot with the data breakpoint
+
+# ---- the watch (op 09): any single value live, one at a time -------------
+# The MPC555's L-bus comparators E and F (SPR 152/153) bracket the watched
+# slot's calibration range and the first L-bus watchpoint, made a breakpoint
+# (LCTRL2 SLW0EN), takes vector 0x1C00 after each read of it: the load has
+# executed, SRR0 is the next instruction and BAR (SPR 159) holds the address.
+# The handler below reads the slot's mirror instead and puts that in the
+# load's rD, so a value no pool holds is live without a trap at every site
+# (the trap tier reset the car; singles.py). Masked mode (BRKNOMSK clear)
+# ignores the breakpoint while MSR[RI] is 0, so the kernel's unrecoverable
+# windows are left alone. The main program never touches SPR 144-159.
+CMPE, CMPF, LCTRL1, LCTRL2, BAR = 152, 153, 156, 157, 159
+SRR0, SRR1, SPRG0, SPRG1, SPRG2 = 26, 27, 272, 273, 274
+LCTRL1_RANGE = (0b110 << 29) | (0b101 << 26) | (0b10 << 18) | (0b10 << 16)   # E greater, F less, reads
+LCTRL2_ARM = 0x80000000 | 0x08000000 | 0x02000000 | 0x2       # LW0EN, LW0LA=E&F, LW0LADC, SLW0EN
+BP_VECTOR = 0xE0                   # the data breakpoint's entry in the relocated table
+BP_STOCK = 0xFFF71AFC              # where that entry goes on the stock program
+S_CR, S_CTR, S_WORD = 0x10, 0x14, 0x18      # the handler's scratch (singles.py shares them)
+# The safety monitor's ROM test sums calibration 0x240-0x7C8 by address
+# (fold.MON_*) from this routine: a watched value there must still sum as
+# flash, so a read from here keeps what it loaded.
+MONITOR_READER = (0xFFF77688, 0xFFF776D4)
 
 # request bytes (absolute; emitted r13-relative): 0x3F9A44 SID, .45 id,
 # .46 op, then the args (write: slot .47, offset hword .48, count .4A,
@@ -109,10 +134,11 @@ def _r13(addr):
     return off
 
 
-def _stub(base):
+def _stub(base, stock_bp=BP_STOCK):
     a = Asm(base)
     e = a.emit
     desc = _r13(overlay.DESC)
+    state = _r13(STATE)
 
     # mask MSR[EE] for the whole op: the SCI receive interrupt's byte writer
     # (and the K-line echo of our own response) can tear the request buffer
@@ -133,6 +159,7 @@ def _stub(base):
     e(_d(36, 12, 13, _r13(STATE) + S_MAGIC))
     e(_d(14, 0, 0, 0), _d(36, 0, 13, _r13(STATE) + S_STATUS))
     e(_d(36, 0, 13, _r13(STATE) + S_COUNT))
+    e(_stw(0, state + W_BASE, 13), _stw(0, state + W_END, 13))
     e(_d(14, 0, 0, VERSION), _d(36, 0, 13, _r13(STATE) + S_VERSION))
     a.label("ready")
 
@@ -144,6 +171,7 @@ def _stub(base):
     e(_cmpwi(0, 6), a.bc(BEQ, "shelf"))
     e(_cmpwi(0, 7), a.bc(BEQ, "place"))
     e(_cmpwi(0, 8), a.bc(BEQ, "ask"))
+    e(_cmpwi(0, 9), a.bc(BEQ, "watch"))
     e(_d(14, 0, 0, STATUS_OP), a.b("finish"))
 
     # ---- 02 write: slot, offset in table, byte count, payload ------------
@@ -178,6 +206,7 @@ def _stub(base):
     a.label("close")
     e(_d(14, 0, 0, 0), _d(36, 0, 13, desc))
     e(_d(36, 0, 13, desc + 4), _d(36, 0, 13, _r13(STATE) + S_COUNT))
+    e(_mtspr(LCTRL2, 0), ISYNC, _stw(0, state + W_BASE, 13), _stw(0, state + W_END, 13))   # the watch too
     for at in range(0, overlay.BITMAP_SPACE, 4):
         e(_d(36, 0, 13, _r13(overlay.BITMAP) + at))
     # a mirror placed on a single value's own RAM left its edit there: put
@@ -201,6 +230,23 @@ def _stub(base):
     a.label("ask")
     e(_d(34, 0, 13, _r13(ARG1)), _d(38, 0, 13, _r13(overlay.SAVE_ARMED)))
     e(_d(14, 0, 0, STATUS_OK), a.b("finish"))
+
+    # ---- 09 watch: slot N's range on the data breakpoint; 0xFF takes it off
+    a.label("watch")
+    e(_lbz(12, _r13(ARG1), 13), _cmplwi(12, 0xFF), a.bc(BEQ, "unwatch"))
+    e(_lwz(0, state + S_COUNT, 13), _cmplw(12, 0), a.bc(BLT, "watch_slot"))
+    e(_li(0, STATUS_SLOT), a.b("finish"))
+    a.label("watch_slot")
+    e(_d(7, 11, 12, 12), _addi(11, 11, desc + 4), _add(11, 11, 13))         # r11 = &desc[slot]
+    e(_lwz(12, 0, 11), _lwz(0, 4, 11), _lwz(11, 8, 11))                     # base, end, delta
+    e(_stw(12, state + W_BASE, 13), _stw(0, state + W_END, 13), _stw(11, state + W_DELTA, 13))
+    e(_addi(12, 12, -1), _mtspr(CMPE, 12), _mtspr(CMPF, 0))                 # base-1 < address < end
+    e(_lis(12, LCTRL1_RANGE >> 16), _ori(12, 12, LCTRL1_RANGE & 0xFFFF), _mtspr(LCTRL1, 12))
+    e(_lis(12, LCTRL2_ARM >> 16), _ori(12, 12, LCTRL2_ARM & 0xFFFF), _mtspr(LCTRL2, 12), ISYNC)
+    e(_li(0, STATUS_OK), a.b("finish"))
+    a.label("unwatch")
+    e(_li(0, 0), _mtspr(LCTRL2, 0), ISYNC, _stw(0, state + W_BASE, 13), _stw(0, state + W_END, 13))
+    e(_li(0, STATUS_OK), a.b("finish"))
 
     # ---- 04 state: the block is the answer, read it with stock 23 --------
     a.label("stateop")
@@ -303,30 +349,103 @@ def _stub(base):
     a.label("stock")                        # every path out restores interrupts first
     e(_d(32, 12, 13, _r13(STATE) + S_MSR), 0x7D800124, 0x4C00012C)
     e(STOCK_FIRST, _branch(a.here() + 4, HANDLER + 4))
-    return a.bytes()
+
+    # ---- the data breakpoint (vector 0x1C00): the load at SRR0-4 has read
+    # the watched range at BAR; put the mirror's bytes in its rD instead.
+    # Like singles.py's trap handler: EE and RI are clear from entry to rfi
+    # and nothing here can fault, so SPRG0-2 and the state block's scratch
+    # words are ours. An address outside the range is not ours (the stock
+    # handler gets it, as it came); a load the decode does not know, or the
+    # monitor's ROM test reading, keeps what it loaded.
+    a.label("bp")
+    e(_mtspr(SPRG0, 11), _mtspr(SPRG1, 12), _mtspr(SPRG2, 0), _mfcr(0), _stw(0, state + S_CR, 13))
+    e(_mfspr(12, BAR))
+    e(_lwz(11, state + W_BASE, 13), _cmplw(12, 11), a.bc(BLT, "bp_stock"))
+    e(_lwz(11, state + W_END, 13), _cmplw(12, 11), a.bc(BGE, "bp_stock"))
+    e(_lwz(11, state + W_DELTA, 13), _add(12, 12, 11))                      # r12 = the mirror's byte
+    e(_mfctr(0), _stw(0, state + S_CTR, 13))
+    e(_mfspr(11, SRR0), _lis(0, MONITOR_READER[0] >> 16), _ori(0, 0, MONITOR_READER[0] & 0xFFFF),
+      _cmplw(11, 0), a.bc(BLT, "bp_decode"),
+      _lis(0, MONITOR_READER[1] >> 16), _ori(0, 0, MONITOR_READER[1] & 0xFFFF),
+      _cmplw(11, 0), a.bc(BLT, "bp_out"))
+    a.label("bp_decode")
+    e(_lwz(11, -4, 11), _stw(11, state + S_WORD, 13))                       # the load's word
+    e(_srwi(0, 11, 26), _cmpwi(0, 31), a.bc(BNE, "bp_dform"))
+    e(_rlwinm(0, 11, 31, 22, 31))                                          # X-form: its xo
+    for xo, kind in ((23, "word"), (55, "word"), (87, "byte"), (119, "byte"),
+                     (279, "half"), (311, "half"), (343, "halfs"), (375, "halfs")):
+        e(_cmpwi(0, xo), a.bc(BEQ, "bp_" + kind))
+    e(a.b("bp_out"))
+    a.label("bp_dform")
+    for op, kind in ((32, "word"), (33, "word"), (34, "byte"), (35, "byte"),
+                     (40, "half"), (41, "half"), (42, "halfs"), (43, "halfs")):
+        e(_cmpwi(0, op), a.bc(BEQ, "bp_" + kind))
+    e(a.b("bp_out"))
+    a.label("bp_word")
+    e(_lwz(0, 0, 12), a.b("bp_into"))
+    a.label("bp_byte")
+    e(_lbz(0, 0, 12), a.b("bp_into"))
+    a.label("bp_half")
+    e(_lhz(0, 0, 12), a.b("bp_into"))
+    a.label("bp_halfs")
+    e(_d(42, 0, 12, 0))                                                    # lha
+    a.label("bp_into")
+    e(_rlwinm(11, 11, 14, 24, 28),                                         # rD * 8
+      a.lis_lbl(12, "bp_table"), a.ori_lbl(12, "bp_table"), _add(11, 11, 12), _mtctr(11), BCTR)
+    a.label("bp_table")                                                    # the value into rD
+    for r in range(32):
+        e({0: _mtspr(SPRG2, 0), 11: _mtspr(SPRG0, 0), 12: _mtspr(SPRG1, 0)}.get(r, _mr(r, 0)),
+          a.b("bp_out"))
+    a.label("bp_out")
+    e(_lwz(0, state + S_CTR, 13), _mtctr(0))
+    e(_lwz(0, state + S_CR, 13), _mtcr(0),
+      _mfspr(11, SPRG0), _mfspr(12, SPRG1), _mfspr(0, SPRG2), RFI)
+    a.label("bp_stock")
+    e(_lwz(0, state + S_CR, 13), _mtcr(0),
+      _mfspr(11, SPRG0), _mfspr(12, SPRG1), _mfspr(0, SPRG2), _ba(stock_bp))
+    return a.bytes(), a.labels
+
+
+_STUB, _LABELS = _stub(0xFFF00000 + CODE)
+STUB_SIZE = len(_STUB)
+LABEL_OFFSETS = {name: at - (0xFFF00000 + CODE) for name, at in _LABELS.items()}   # the same at any base
+
+
+def stub_base(pair):
+    """Where the stub starts, from the hooked 2C entry; None when it is not there."""
+    t = _btarget(HANDLER, struct.unpack_from(">I", pair.flash, HFILE)[0])
+    return t if t is not None and 0xFFF00000 + CODE <= t < 0xFFF00000 + CODE_END else None
 
 
 def is_patched(pair):
-    t = _btarget(HANDLER, struct.unpack_from(">I", pair.flash, HFILE)[0])
-    return t is not None and 0xFFF00000 + CODE <= t < 0xFFF00000 + CODE_END
+    return stub_base(pair) is not None
 
 
 def build(pair, code=CODE):
-    """The pair with the 2C handler hooked and our stub in blank ext space,
-    re-signed. Composes after overlay.build (which owns the MPC tail)."""
+    """The pair with the 2C handler hooked, our stub in blank ext space and
+    the data breakpoint's vector on the stub's handler, re-signed. Composes
+    after overlay.build (which owns the MPC tail)."""
     mpc, flash = bytearray(pair.mpc), bytearray(pair.flash)
     w = struct.unpack_from(">I", flash, HFILE)[0]
     if w != STOCK_FIRST and not is_patched(pair):
         raise ValueError(f"the 2C handler's entry word is not the stock stwu: 0x{w:08X}")
+    vector = struct.unpack_from(">I", mpc, BP_VECTOR)[0]
+    if vector >> 26 != 18 or not vector & 2:
+        raise ValueError(f"the data breakpoint's table entry is not a `ba`: 0x{vector:08X}")
+    stock_bp = vector & 0x03FFFFFC
+    stock_bp |= 0xFC000000 if stock_bp & 0x02000000 else 0
+    if 0xFFF00000 + CODE <= stock_bp < 0xFFF00000 + CODE_END:
+        stock_bp = BP_STOCK                                      # ours already: the stock is known
     if is_patched(pair):
         flash[code:CODE_END] = b"\xff" * (CODE_END - code)      # our own stub, rebuilt
     if flash[code:CODE_END].strip(b"\xff"):
         raise ValueError(f"the ext space from 0x{code:X} is not blank")
-    stub = _stub(0xFFF00000 + code)
+    stub, labels = _stub(0xFFF00000 + code, stock_bp)
     if code + len(stub) > CODE_END:
         raise ValueError("the transport stub does not fit")
     flash[code:code + len(stub)] = stub
     struct.pack_into(">I", flash, HFILE, _branch(HANDLER, 0xFFF00000 + code))
+    struct.pack_into(">I", mpc, BP_VECTOR, _ba(labels["bp"]))
     fix_program(flash, mpc)
     return Pair(bytes(flash), bytes(mpc), pair.name + "+livetrans")
 
@@ -341,11 +460,14 @@ def _op(t, request):
 
 
 def read_state(t):
-    """The block: status, open count, protocol version, last mirror."""
-    magic, status, count, version, _, _, _, mirror = struct.unpack(">8I", t.read_memory(STATE, 8 * 4))
+    """The block: status, open count, protocol version, last mirror, and the
+    watched range (base, end) or None."""
+    (magic, status, count, version, _, _, _, mirror,
+     _, w_base, w_end, _) = struct.unpack(">12I", t.read_memory(STATE, S_SIZE))
     if magic != STATE_MAGIC:
         raise ValueError("the state block is not initialised (no 0x6C op has run)")
-    return {"status": status, "count": count, "version": version, "mirror": mirror}
+    return {"status": status, "count": count, "version": version, "mirror": mirror,
+            "watch": (w_base, w_end) if w_end else None}
 
 
 def descriptors(t):
@@ -361,10 +483,15 @@ def descriptors(t):
 def place(t, slot, cal_offset, length, mirror):
     """Op 07: `slot` serves the range from `mirror` -- a RAM address in a
     pool, or a calibration offset on the shelf. The status."""
-    return _op(t, [0x2C, LOCAL_ID, 0x07, slot,
-                   (cal_offset >> 16) & 0xFF, (cal_offset >> 8) & 0xFF, cal_offset & 0xFF,
-                   length >> 8, length & 0xFF,
-                   (mirror >> 16) & 0xFF, (mirror >> 8) & 0xFF, mirror & 0xFF])["status"]
+    st = _op(t, [0x2C, LOCAL_ID, 0x07, slot,
+                 (cal_offset >> 16) & 0xFF, (cal_offset >> 8) & 0xFF, cal_offset & 0xFF,
+                 length >> 8, length & 0xFF,
+                 (mirror >> 16) & 0xFF, (mirror >> 8) & 0xFF, mirror & 0xFF])
+    # the breakpoint keeps the mirror it was armed with: a watched slot that
+    # moved is armed again
+    if not st["status"] and st["watch"] and st["watch"][0] == dme.CAL_BASE + cal_offset:
+        watch(t, slot)
+    return st["status"]
 
 
 def open_table(t, cal_offset, length):
@@ -417,8 +544,19 @@ def ask_save(t, on=True):
     return _op(t, [0x2C, LOCAL_ID, 0x08, overlay.SAVE_ASKED if on else 0])["status"]
 
 
+def watch(t, slot):
+    """Op 09: slot `slot`'s range goes on the data breakpoint, so every read
+    of it sees the mirror -- one slot at a time, the last asked. The status."""
+    return _op(t, [0x2C, LOCAL_ID, 0x09, slot])["status"]
+
+
+def unwatch(t):
+    """Op 09 with 0xFF: the breakpoint off; the slot stays open."""
+    return _op(t, [0x2C, LOCAL_ID, 0x09, 0xFF])["status"]
+
+
 def close_all(t):
-    """overlay.remove(), from the K line; returns the fresh state."""
+    """overlay.remove(), from the K line (and the watch off); returns the fresh state."""
     return _op(t, [0x2C, LOCAL_ID, 0x03])
 
 
