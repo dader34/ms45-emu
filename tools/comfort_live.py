@@ -36,7 +36,7 @@ FAMILIES = {
     "abc": "Fault debounce counters", "det": "Fault debounce counters", "inh": "Inhibits",
     "cppwm": "Canister purge", "cps": "Canister purge",
     "seg": "Crank segments and misfire", "mis": "Crank segments and misfire",
-    "cam": "VANOS", "vvt": "VANOS", "ecf": "Electric fan", "ac": "Air conditioning",
+    "cam": "VANOS", "vvt": "VANOS", "ecf": "Electric fan", "ecfpwm": "Electric fan", "ac": "Air conditioning",
     "is": "Idle", "aj": "Adaptation",
 }
 
