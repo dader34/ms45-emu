@@ -110,6 +110,10 @@ S_CR, S_CTR, S_WORD = 0x10, 0x14, 0x18      # the handler's scratch (singles.py 
 # (fold.MON_*) from this routine: a watched value there must still sum as
 # flash, so a read from here keeps what it loaded.
 MONITOR_READER = (0xFFF77688, 0xFFF776D4)
+# the canary (op 0A) may plant anywhere in the variables below the stack, except
+# the request buffer and the state block it is running from
+CANARY_LOW, CANARY_HIGH = 0x3F9800, 0x3FF900
+CANARY_KEEP = ((0x3F9A44, 0x3F9B44), (STATE, STATE + 0x30))
 
 # request bytes (absolute; emitted r13-relative): 0x3F9A44 SID, .45 id,
 # .46 op, then the args (write: slot .47, offset hword .48, count .4A,
@@ -172,6 +176,7 @@ def _stub(base, stock_bp=BP_STOCK):
     e(_cmpwi(0, 7), a.bc(BEQ, "place"))
     e(_cmpwi(0, 8), a.bc(BEQ, "ask"))
     e(_cmpwi(0, 9), a.bc(BEQ, "watch"))
+    e(_cmpwi(0, 10), a.bc(BEQ, "canary"))
     e(_d(14, 0, 0, STATUS_OP), a.b("finish"))
 
     # ---- 02 write: slot, offset in table, byte count, payload ------------
@@ -247,6 +252,28 @@ def _stub(base, stock_bp=BP_STOCK):
     a.label("unwatch")
     e(_li(0, 0), _mtspr(LCTRL2, 0), ISYNC, _stw(0, state + W_BASE, 13), _stw(0, state + W_END, 13))
     e(_li(0, STATUS_OK), a.b("finish"))
+
+    # ---- 0A canary: fill RAM [addr, addr+len) with a byte -- a stretch the
+    # survey calls free is planted, driven on, and read back with stock 23:
+    # what the DME overwrote was not free (tools/ram_writers.py). ARG1-3 the
+    # address, ARG4 the length (1-255), ARG4+1 the byte. Only the variables
+    # below the stack, and never our own request buffer or state.
+    a.label("canary")
+    e(_lbz(12, _r13(ARG1), 13), _slwi(12, 12, 16), _lhz(0, _r13(ARG1) + 1, 13), _or(12, 12, 0))
+    e(_lbz(11, _r13(ARG4), 13), _cmpwi(11, 0), a.bc(BEQ, "canary_bad"))
+    e(_lis(0, CANARY_LOW >> 16), _ori(0, 0, CANARY_LOW & 0xFFFF), _cmplw(12, 0), a.bc(BLT, "canary_bad"))
+    e(_add(0, 12, 11), _lis(11, CANARY_HIGH >> 16), _ori(11, 11, CANARY_HIGH & 0xFFFF),
+      _cmplw(0, 11), a.bc(BGT, "canary_bad"))
+    for lo, hi in CANARY_KEEP:                                 # ours: refused
+        e(_addi(11, 13, _r13(hi)), _cmplw(12, 11), a.bc(BGE, f"canary_not{lo:X}"))
+        e(_addi(11, 13, _r13(lo)), _cmplw(0, 11), a.bc(BGT, "canary_bad"))
+        a.label(f"canary_not{lo:X}")
+    e(_lbz(11, _r13(ARG4), 13), _mtctr(11), _lbz(0, _r13(ARG4) + 1, 13))
+    a.label("canary_fill")
+    e(_d(38, 0, 12, 0), _addi(12, 12, 1), a.bc(BDNZ, "canary_fill"))
+    e(_li(0, STATUS_OK), a.b("finish"))
+    a.label("canary_bad")
+    e(_li(0, STATUS_RANGE), a.b("finish"))
 
     # ---- 04 state: the block is the answer, read it with stock 23 --------
     a.label("stateop")
@@ -536,6 +563,13 @@ def park(t, slot, shelf_offset):
     cal_offset, length, mirror = descriptors(t)[slot]
     data = b"".join(t.read_memory(mirror + at, min(120, length - at)) for at in range(0, length, 120))
     return program(t, shelf_offset, data) or place(t, slot, cal_offset, length, shelf_offset)
+
+
+def canary(t, addr, length, byte=0xA5):
+    """Op 0A: fill RAM [addr, addr+length) with `byte`. The status."""
+    assert 1 <= length <= 0xFF
+    return _op(t, [0x2C, LOCAL_ID, 0x0A, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF,
+                   length, byte])["status"]
 
 
 def ask_save(t, on=True):
