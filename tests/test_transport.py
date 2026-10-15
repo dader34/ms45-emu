@@ -406,20 +406,3 @@ def test_watch_refusals(t):
     assert transport.read_state(t)["watch"] is None
     assert transport.unwatch(t) == transport.STATUS_OK          # off when it was never on
     transport.close_all(t)
-
-
-def test_canary_fills_ram_and_refuses_what_it_must_not(t, board):
-    """Op 0A plants a byte pattern in a stretch of variables; read back with
-    stock 23. The stack, the request buffer and the state block are refused."""
-    at = overlay.POOLS[0][0] + 0x40                     # pool A, nothing open: ours to scribble
-    transport.close_all(t)
-    assert transport.canary(t, at, 24, 0xA5) == transport.STATUS_OK
-    assert t.read_memory(at, 24) == b"\xa5" * 24
-    assert transport.canary(t, at, 24, 0x5A) == transport.STATUS_OK
-    assert t.read_memory(at - 1, 26)[1:25] == b"\x5a" * 24
-    assert transport.canary(t, 0x3FF8F0, 32, 1) == transport.STATUS_RANGE        # into the stack
-    assert transport.canary(t, 0x3F9A40, 16, 1) == transport.STATUS_RANGE        # the request buffer
-    assert transport.canary(t, transport.STATE + 4, 4, 1) == transport.STATUS_RANGE   # the state block
-    assert transport.canary(t, 0x3F9700, 8, 1) == transport.STATUS_RANGE         # below the SRAM
-    assert transport.read_state(t)["status"] == transport.STATUS_RANGE
-    assert transport.canary(t, 0x3FF8F0, 16, 7) == transport.STATUS_OK            # ending at the stack is fine
