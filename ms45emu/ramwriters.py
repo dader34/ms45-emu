@@ -191,20 +191,51 @@ class Writers:
         self.fm = FunctionMap(pair)
         self.stores, self.pointer_functions = scan_stores(self.fm, read32)
         self.phase = phases(self.fm, executed)
+        # an indexed array's extent is taken to end where the next placed
+        # variable starts (the compiler lays them out back to back), capped
+        self._starts = sorted({s.addr for s in self.stores if s.base != "indexed"})
+
+    def extent(self, base):
+        import bisect
+        i = bisect.bisect_right(self._starts, base)
+        nxt = self._starts[i] if i < len(self._starts) else base + INDEX_REACH
+        return max(1, min(nxt - base, INDEX_REACH))
 
     def of(self, lo, hi):
-        """The placed stores that hit [lo, hi), as Writers."""
+        """The placed stores that hit [lo, hi), as Writers (an indexed array
+        store carries size 0; see `extent`)."""
         out = []
         for s in self.stores:
             if s.base == "indexed":
-                # an array store: its base below the stretch and within reach (a
-                # few hundred bytes) may run into it; reported as size 0
-                if s.addr != R13 and lo - INDEX_REACH <= s.addr < hi:
+                if s.addr != R13 and s.addr < hi and s.addr + self.extent(s.addr) > lo:
                     out.append(Writer(s.pc, s.function, self.phase[s.function], task_of(self.fm, s.function), 0))
             elif s.addr < hi and s.addr + s.size > lo:
                 out.append(Writer(s.pc, s.function, self.phase[s.function], task_of(self.fm, s.function),
                                   s.size if s.base != "ptr" else -s.size))
         return sorted(out, key=lambda w: (w.phase != "runtime", w.size == 0, w.pc))
+
+    def free_within(self, lo, hi, least=16):
+        """The sub-stretches of [lo, hi) no run-time or unknown-phase placed
+        store (array extents included) reaches: [(lo, hi)] of `least` bytes or more."""
+        hit = bytearray(hi - lo)
+        for s in self.stores:
+            if self.phase[s.function] == "init":
+                continue
+            n = self.extent(s.addr) if s.base == "indexed" else s.size
+            if s.base == "indexed" and s.addr == R13:
+                continue
+            for a in range(max(s.addr, lo), min(s.addr + n, hi)):
+                hit[a - lo] = 1
+        out, start = [], None
+        for i in range(hi - lo + 1):
+            ok = i < hi - lo and not hit[i]
+            if ok and start is None:
+                start = i
+            if not ok and start is not None:
+                if i - start >= least:
+                    out.append((lo + start, lo + i))
+                start = None
+        return out
 
     def pointer_risk(self):
         """Functions that store through computed pointers, by phase."""

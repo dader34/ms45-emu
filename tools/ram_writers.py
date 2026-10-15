@@ -122,12 +122,21 @@ def main():
     ap.add_argument("--range", action="append", default=[], metavar="LO-HI", help="look at this stretch instead")
     ap.add_argument("--no-survey", action="store_true", help="static only: no coverage, --range required")
     ap.add_argument("--top", type=int, default=40, help="stretches to report")
+    ap.add_argument("--survey-file", help="pickle the survey here, or load it from here when it exists")
     args = ap.parse_args()
     pair = load_named(args.pair)
     executed, touched = set(), None
-    if not args.no_survey:
+    import pickle
+    if args.survey_file and os.path.exists(args.survey_file):
+        with open(args.survey_file, "rb") as f:
+            touched, executed = pickle.load(f)
+    elif not args.no_survey:
         print("surveying (boot, running, after-run; a few minutes)...", flush=True)
         touched, executed = survey(pair)
+        if args.survey_file:
+            with open(args.survey_file, "wb") as f:
+                pickle.dump((touched, executed), f)
+    if touched is not None:
         print(f"functions seen running: {len(executed)}")
     # a booted board's RAM places the stores made through pointers the boot set up
     b = Board(pair, mips=20)
@@ -149,14 +158,16 @@ def main():
             kind = ("boot-only" if any(touched["boot"][a - LO] for a in range(lo, hi)) else
                     "after-run-only" if any(touched["after"][a - LO] for a in range(lo, hi)) else "untouched")
         v = w.verdict(lo, hi)
-        if v in ("init-only writers", "no placeable writer"):
-            free_total += hi - lo
-        print(f"\n{lo:X}-{hi:X} {hi - lo:5} B  {kind:14s} {v}")
+        sub = w.free_within(lo, hi, args.least)
+        free_total += sum(b - a for a, b in sub)
+        print(f"\n{lo:X}-{hi:X} {hi - lo:5} B  {kind:14s} {v}"
+              + (f"; untouched by any placed run-time store: " + ", ".join(f"{a:X}-{b:X} ({b - a} B)" for a, b in sub) if sub else ""))
         for ws in w.of(lo, hi)[:12]:
             what = "indexed array, extent unknown" if ws.size == 0 else f"{abs(ws.size)} B" + (" via pointer" if ws.size < 0 else "")
             print(f"    {ws.phase:8s} {ws.pc:08X} {ws.function.label:28s} {ws.task or '':16s} {what}")
     risk = w.pointer_risk()
-    print(f"\nstretches with no run-time writer the code can place: {free_total} B in total")
+    print(f"\nbytes no placed run-time store reaches, in stretches of {args.least}+: {free_total} B in total "
+          "(stores through computed pointers excepted: see below)")
     print(f"\nfunctions storing through computed pointers: runtime {len(risk['runtime'])}, "
           f"init {len(risk['init'])}, unknown {len(risk['unknown'])}. The run-time ones:")
     for f, k in sorted(risk["runtime"], key=lambda x: -x[1])[:25]:
