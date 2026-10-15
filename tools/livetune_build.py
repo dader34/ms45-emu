@@ -75,11 +75,49 @@ def clean_base(pair, stock_flash, stock_mpc):
             [(a, n) for a, n in kept if not sums(a)])
 
 
-def build(source="session1", stock=None, traps=False):
+def prefer_path(pair):
+    """names/<program>.prefer.txt: the single values the pool takes first."""
+    return os.path.join(os.path.dirname(singles.__file__), "names",
+                        f"{pair.program_id.decode('latin1')}.prefer.txt")
+
+
+def preferred_rates(pair, path):
+    """The profiled read rates with the symbols listed in `path` (one a line,
+    # comments) raised above every other: the pool takes them first and
+    fills the rest by rate. (offsets preferred, rates)."""
+    from ms45emu.xdf import Xdf
+    xdf = Xdf.find(pair)
+    if xdf is None:
+        raise SystemExit("no XDF for this program: the preference needs the symbols' offsets")
+    with open(path) as f:
+        symbols = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    rates = singles.load_rates(pair)
+    offsets = []
+    for name in symbols:
+        item = xdf.by_name(name)
+        if item is not None and item.kind == "constant":
+            offsets.append(item.offset)
+            rates[item.offset] = max(rates.get(item.offset, 0), 1e9)
+    return offsets, rates
+
+
+def build(source="session1", stock=None, traps=False, prefer=True):
     pair = load_named(source)
     if stock:
         pair, _kept = clean_base(pair, *stock)
-    return singles.build(fold.build(transport.build(overlay.build(pair))), traps=traps)
+    rates, offsets = None, []
+    path = prefer_path(pair)
+    if prefer and os.path.exists(path):
+        offsets, rates = preferred_rates(pair, path)
+    layers = fold.build(transport.build(overlay.build(pair)))
+    built = singles.build(layers, rates=rates, traps=traps)
+    if offsets:
+        p = singles.plan(layers, rates)
+        pooled = sum(1 for o in offsets if any(lo <= o < lo + n for lo, (n, _) in p.pool.items()))
+        used = sum(n for n, _ in p.pool.values())
+        print(f"preferred single values: {len(offsets)} named, {pooled} in the pool; "
+              f"pool {used} of {singles.POOL[1] - singles.POOL[0]} B, {len(p.pool)} values")
+    return built
 
 
 def main():
@@ -93,12 +131,14 @@ def main():
                     help="with --stock: also write the unpatched base pair here")
     ap.add_argument("--out-prefix", default=None,
                     help="output path prefix (default images/<source>.livetune)")
+    ap.add_argument("--no-prefer", action="store_true",
+                    help="choose the pool by read rate alone, ignoring names/<program>.prefer.txt")
     ap.add_argument("--traps", action="store_true",
                     help="add the single-value trap tier (resets the car's DME at 3 krpm: experiments only)")
     args = ap.parse_args()
     prefix = args.out_prefix or os.path.join(IMAGES_DIR, f"{args.source}.livetune")
 
-    built = build(args.source, args.stock, args.traps)
+    built = build(args.source, args.stock, args.traps, prefer=not args.no_prefer)
     if args.stock:
         print(f"built on the stock program: map-switch generation present = {overlay.carries_old(built)}")
         if args.base_prefix:
