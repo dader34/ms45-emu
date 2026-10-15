@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ms45emu import singles                             # noqa: E402
 from ms45emu.image import load_named                    # noqa: E402
 from ms45emu.xdf import Xdf                             # noqa: E402
+from comfort_names import name_for                      # noqa: E402  (tools/comfort_names.py)
 
 # the family a symbol's first word puts it in (c_n_max_er -> "n")
 FAMILIES = {
@@ -45,10 +46,13 @@ def family(name):
     head = parts[1] if parts[0] in ("c", "lc", "ip", "id", "sa") and len(parts) > 1 else parts[0]
     if parts[0] == "lc":
         return "Switches"
-    return FAMILIES.get(head, "Other")
+    return FAMILIES.get(head, "Other values")
 
 
 def plain(item):
+    named = name_for(item.name)
+    if named:
+        return named
     d = re.sub(r"\s+", " ", (item.description or "").replace("&quot;", '"')).strip(" .")
     if not re.search(r"[A-Za-z]", d) or d.lower() == item.name.lower():
         return item.name                        # nothing said, or "????": the symbol is honest
