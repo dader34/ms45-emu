@@ -190,10 +190,15 @@ def main():
         xab = linear(item.equation)
         row = (item.name, offset, item.equation or "X", item.units, a, b, units, n, total,
                sorted(set(e[2] for e in evidence[offset]))[:3])
+        close = lambda p, q: abs(p - q) <= 0.025 * max(abs(p), abs(q), 1e-12)   # noqa: E731 (the XDF rounds to 6 places)
         if xab is None:
             unknown_eq.append(row)
-        elif abs(xab[0] - a) <= 0.01 * max(abs(a), 1e-9) and abs(xab[1] - b) <= 0.5:
+        elif a == 0:
+            unknown_eq.append(row)                       # the measurement map has no scale for that value
+        elif close(xab[0], a) and abs(xab[1] - b) <= 0.5:
             agree.append(row)
+        elif close(xab[0], a * 256) or close(xab[0] * 256, a):
+            agree.append(row)                            # a byte constant against a word variable (<< 8)
         else:
             disagree.append(row)
             if xab == (1.0, 0.0) and (a, b) != (1.0, 0.0):
