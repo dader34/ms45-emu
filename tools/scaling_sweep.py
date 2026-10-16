@@ -4,8 +4,8 @@ them: a constant compared with, added to, or stored into a RAM variable
 whose scaling is known has that variable's scaling.
 
     .venv/bin/python tools/scaling_sweep.py [--pair session1clean]
-        [--values ../inpa-mac-bridge/app/renderer/core/ms45-value-map.js]
-        [--cursor ../inpa-mac-bridge/app/renderer/core/ms45-cursor-map.js]
+        [--values ../inpa-mac-bridge/app/renderer/core/ms45/ms45-value-map.js]
+        [--cursor ../inpa-mac-bridge/app/renderer/core/ms45/ms45-cursor-map.js]
         [--report FILE]
 
 Known variables come from two generated maps: the DME's own measurement
@@ -33,7 +33,7 @@ from ms45emu.ppc import R13                             # noqa: E402
 from ms45emu.xdf import Xdf                             # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BMWEB = os.path.join(HERE, "..", "..", "inpa-mac-bridge", "app", "renderer", "core")
+BMWEB = os.path.join(HERE, "..", "..", "inpa-mac-bridge", "app", "renderer", "core", "ms45")
 WINDOW = 24                                             # instructions after the load that count
 
 

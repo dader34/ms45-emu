@@ -24,7 +24,7 @@ and scaled to the same figure:  figure = a * raw + b.  That is what the tuning
 screen wants: its gauges ride in the live cursor's packet, which is defined by
 address, and a packet cannot mix addresses with identifiers.
 
---js writes the map packed for BMWeb (core/ms45-value-map.js). Unless
+--js writes the map packed for BMWeb (core/ms45/ms45-value-map.js). Unless
 --no-check, the program is run in the emulator and every mapped value is read
 both ways, by identifier and from RAM, and the two figures compared.
 """

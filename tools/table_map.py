@@ -3,7 +3,7 @@
 "what does this table do" map for BMWeb's tuning page.
 
     .venv/bin/python tools/table_map.py                       # the car's own pair, to stdout as JSON
-    .venv/bin/python tools/table_map.py --js ../inpa-mac-bridge/app/renderer/core/ms45-table-map.js
+    .venv/bin/python tools/table_map.py --js FILE   (BMWeb no longer ships the map; JSON to stdout by default)
 
 Every function of the program is scanned the way tools/explain.py scans one
 (ms45emu/explain.py, static only: the registers that hold a calibration or
