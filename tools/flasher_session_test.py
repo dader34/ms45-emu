@@ -147,9 +147,9 @@ def main():
     if not s.until(lambda: len(sci.tx) >= 21):
         raise SystemExit("FAIL: no HELLO after the break released")
     hello = bytes(sci.tx[:21])
-    if hello != frame(0x40, stamp_bytes(8, 1)):
+    if hello != frame(0x40, stamp_bytes(9, 1)):
         raise SystemExit(f"FAIL: HELLO mismatch: {hello.hex()} "
-                         f"(want {frame(0x40, stamp_bytes(8, 1)).hex()})")
+                         f"(want {frame(0x40, stamp_bytes(9, 1)).hex()})")
     print(f"hello: {hello[4:10].decode()} v{hello[10]} flags {hello[11]:#04x}")
     board.watchdog_window()                      # the body runs from here
     board.sci.model_overrun = True               # the real SCI drops, it does not wait

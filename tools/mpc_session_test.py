@@ -76,7 +76,7 @@ def main():
     if not s.until(lambda: len(board.sci.tx) >= 21):
         raise SystemExit("FAIL: no HELLO after the break released")
     hello = bytes(board.sci.tx[:21])
-    if hello != frame(0x40, stamp_bytes(8, 1)):
+    if hello != frame(0x40, stamp_bytes(9, 1)):
         raise SystemExit(f"FAIL: HELLO mismatch: {hello.hex()}")
     print(f"hello: {hello[4:10].decode()} v{hello[10]} flags {hello[11]:#04x}")
     board.watchdog_window()                      # the body runs from here
@@ -88,14 +88,32 @@ def main():
     SCC1R0 = 0x305008
 
     # ---- SET_BAUD: switch, hold, and the silent fallback ---------------
+    scbr = lambda: board.imb.peek16(SCC1R0) & 0x1FFF           # noqa: E731
+    # a new rate, used but never confirmed: the body gives it up (v8 kept any
+    # rate it could read telegrams at, and a one-way line stranded the car)
     expect(s.xfer(0x07, struct.pack(">H", 5)), 0x07, "SET_BAUD to SCBR 5 (250 kbaud)")
-    if board.imb.peek16(SCC1R0) != 5:
-        raise SystemExit(f"FAIL: SCBR after SET_BAUD is {board.imb.peek16(SCC1R0)}, want 5")
+    if scbr() != 5:
+        raise SystemExit(f"FAIL: SCBR after SET_BAUD is {scbr()}, want 5")
     expect(s.xfer(0x00), 0x00, "HELLO at 250 kbaud")
     expect(s.xfer(0x01, struct.pack(">II", 0x40000, 0x1000)), 0x01, "QUERY at 250 kbaud")
+    if not s.until(lambda: scbr() == 11, budget=200_000_000):
+        raise SystemExit(f"FAIL: unconfirmed, the body did not fall back to 115200 (SCBR {scbr()})")
+    print("  ok: a rate used but never confirmed: the body fell back to 115200 by itself")
+    expect(s.xfer(0x00), 0x00, "HELLO at 115200 after the fallback")
+    # confirmed, it holds through silence; then back by request, confirmed
+    expect(s.xfer(0x07, struct.pack(">H", 5)), 0x07, "SET_BAUD to SCBR 5 again")
+    expect(s.xfer(0x00), 0x00, "HELLO at 250 kbaud")
+    expect(s.xfer(0x07, struct.pack(">H", 5)), 0x07, "SET_BAUD 5 while on 5: confirmed")
+    s.until(lambda: False, budget=150_000_000)
+    if scbr() != 5:
+        raise SystemExit(f"FAIL: confirmed rate did not hold (SCBR {scbr()})")
+    print("  ok: confirmed, 250 kbaud held through 3.7 s of silence")
+    expect(s.xfer(0x07, struct.pack(">H", 11)), 0x07, "SET_BAUD back to SCBR 11")
+    expect(s.xfer(0x00), 0x00, "HELLO at 115200")
+    expect(s.xfer(0x07, struct.pack(">H", 11)), 0x07, "confirmed at 115200")
     expect(s.xfer(0x07, struct.pack(">H", 4)), 0x07, "SET_BAUD to SCBR 4, then silence")
-    if not s.until(lambda: board.imb.peek16(SCC1R0) == 11, budget=200_000_000):
-        raise SystemExit(f"FAIL: the body did not fall back to 115200 (SCBR {board.imb.peek16(SCC1R0)})")
+    if not s.until(lambda: scbr() == 11, budget=200_000_000):
+        raise SystemExit(f"FAIL: silent after SET_BAUD, no fallback (SCBR {scbr()})")
     print("  ok: silent after SET_BAUD: the body fell back to 115200 by itself")
     expect(s.xfer(0x00), 0x00, "HELLO at 115200 after the fallback")
     expect_nak(s.xfer(0x07, struct.pack(">H", 0)), 0x07, 6, "SET_BAUD 0 refused")

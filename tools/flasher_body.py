@@ -54,9 +54,13 @@ Wire (115200, KWP-shaped telegrams, polled I/O, stop-and-wait):
     the decoded data is `pages` pagesets, each the 64-byte page of every
     selected block in ascending block order; declen = pages x blocks x
     64 <= 4096. SET_BAUD (u16 SCBR) answers at the old rate, then
-    switches; unless a telegram arrives within ~2.4 s the body falls
-    back to 115200 by itself (a rate the line cannot carry costs nothing
-    but that wait). The CMF writes are the boot
+    switches, on probation: only a SET_BAUD naming the rate it is already
+    on -- the tester's confirmation that it HEARD an answer there -- ends
+    the probation; anything else is served but does not count, and after
+    ~120 loop turns without it (~2.4 s of silence, less with traffic) the
+    body puts 115200 back by itself. (v8 ended the probation on any valid
+    telegram: a rate the tester could drive but not hear stranded the car
+    on 2026-10-21.) The CMF writes are the boot
     loader's own driver (docs/fast-flasher.md, "The MPC (CMF) writes on
     silicon"): a hand-written sequence reset the car, so the body copies
     the loader's position-independent driver out of the protected boot
@@ -87,7 +91,7 @@ RXBUF, DSTBUF = 0x3FC000, 0x3FD800
 STACK_TOP = 0x3FBFF0
 CRC_TABLE = 0x3FB900                      # 256 words, built at entry
 BAUD_PROBE = 0x3FAFF0                     # SET_BAUD probation: cmd-loop timeouts left
-BAUD_PROBATION = 120                      # x ~20 ms rx timeout = ~2.4 s to hear a telegram
+BAUD_PROBATION = 120                      # cmd-loop turns (x ~20 ms when silent) to be confirmed
 ENTRY_AT, BODY_AT = 0xFD400, 0xFD500      # ext offsets; stub at ENTRY copies from BODY_AT
 EXT = 0xFFF00000
 
@@ -1009,24 +1013,23 @@ def build_body():
     # ---- the command loop ----------------------------------------------
     a.label("cmd")
     a.bl("rx_telegram")
-    a.cmplwi(3, 0)
-    a.bne("cmd_ok")
-    # nothing (or garbage): after a SET_BAUD this counts down the probation,
-    # and at zero the body goes back to 115200 on its own
+    # on probation after a SET_BAUD, every turn counts -- a telegram the
+    # body can read says nothing about whether the tester hears its answers
+    # -- and at zero the body goes back to 115200 on its own; only the
+    # tester's confirmation (op_setbaud, the same rate) ends it
+    a.mr(24, 3)
     a.li32(5, BAUD_PROBE)
     a.lwz(6, 0, 5)
     a.cmplwi(6, 0)
-    a.beq("cmd")
+    a.beq("cmd_probed")
     a.addic_(6, -1)
     a.stw(6, 0, 5)
-    a.bne("cmd")
+    a.bne("cmd_probed")
     a.li(3, SCBR_115200)
     a.sth(3, 0, 30)
-    a.b("cmd")
-    a.label("cmd_ok")
-    a.li32(5, BAUD_PROBE)                   # a telegram at this rate: it holds
-    a.li(6, 0)
-    a.stw(6, 0, 5)
+    a.label("cmd_probed")
+    a.cmplwi(24, 0)
+    a.beq("cmd")                            # nothing, or garbage already NAKed
     a.li32(3, RXBUF)
     a.lbz(3, 3, 3)                          # the service byte
     a.cmplwi(3, S_HELLO)
@@ -1230,12 +1233,20 @@ def build_body():
     a.beq("sb_mal")
     a.cmplwi(24, 0x1FFF)
     a.bgt("sb_mal")
+    a.lhz(25, 0, 30)                        # the rate the SCI is on now
+    a.andi_(25, 25, 0x1FFF)
     a.li(3, 0)
     a.li(4, S_SETBAUD | 0x40)
     a.bl("send_reply")                      # its last echo read: the line is quiet
-    a.sth(24, 0, 30)
     a.li32(5, BAUD_PROBE)
+    a.cmplw(24, 25)
+    a.beq("sb_confirm")
+    a.sth(24, 0, 30)                        # a new rate: switch, on probation
     a.li(6, BAUD_PROBATION)
+    a.stw(6, 0, 5)
+    a.b("cmd")
+    a.label("sb_confirm")                   # the rate it is on: the tester heard us
+    a.li(6, 0)
     a.stw(6, 0, 5)
     a.b("cmd")
     a.label("sb_mal")
