@@ -9,6 +9,8 @@ collected in `tx` (and handed to `on_tx` if set) and echoed back into
 the receiver, as the single wire does.
 """
 
+import sys
+
 QSMCM = 0x305000
 QDSCI_IL = QSMCM + 0x4              # SCI interrupt level (bits 2-0); the firmware uses level 0
 SCC1R0 = QSMCM + 0x8
@@ -18,6 +20,7 @@ SC1DR = QSMCM + 0xE
 
 # SCC1R1
 TIE, TCIE, RIE, ILIE, TE, RE = 0x80, 0x40, 0x20, 0x10, 0x08, 0x04
+PE, M = 0x0400, 0x0200
 # SC1SR
 TDRE, TC, RDRF, RAF, IDLE, OR = 0x100, 0x80, 0x40, 0x20, 0x10, 0x08
 
@@ -40,6 +43,24 @@ class Sci:
         self.on_tx = None
         self._rdr = 0
         self._sr_read = False
+        self.line_hold = False         # the tester drives the line low (a break)
+        # Bytes sent while SCC1R1 was not 8E1 (PE|M). The emulated line
+        # carries them whole, but a real tester at 8E1 reads them garbled:
+        # flasher v3 sent 8N1 and every reply arrived mangled on the car.
+        self.frame_mismatch = 0
+        # Real SCI: a byte that completes while the last is still unread is
+        # lost (OR set). Off by default -- the emulated CPU can be slower than
+        # the real one (Board(mips=10)), and the line then waits for it --
+        # but a polled driver must be tested with it on: flasher v5 read its
+        # echoes only after sending a whole reply, which the waiting line
+        # hid and the car's overrun did not.
+        self.model_overrun = False
+        self.overruns = 0
+        # With model_overrun the transmitter takes a byte time too: TDRE
+        # comes back, and the echo arrives, when the byte is off the wire.
+        # An instant transmitter let v5 send a whole reply before its first
+        # echo existed, so its late drain never overran here.
+        self.tx_free_at = 0
         page.poke16(SC1SR, TDRE | TC)
         page.on_read(SC1SR, self._sr_read_fn)
         page.on_read(SC1DR, self._dr_read)
@@ -49,6 +70,13 @@ class Sci:
     # ---- registers --------------------------------------------------------
     def _sr_read_fn(self, addr, size):
         self._sr_read = True
+        # RAF: the receiver is in a frame — a byte still on the line (each
+        # is presented at the end of its byte time) or the tester holding
+        # the line low across a reset. Only with the receiver enabled; the
+        # loader boots the program with the SCI still off, so a gate that
+        # wants RAF must turn RE on itself.
+        if size == 2 and self.p.peek16(SCC1R1) & RE and (self.line_hold or self.rx_queue):
+            return self.p.peek16(SC1SR) | RAF
         return None
 
     def _dr_read(self, addr, size):
@@ -60,11 +88,25 @@ class Sci:
 
     def _dr_write(self, addr, size, value):
         if self.p.peek16(SCC1R1) & TE:
+            if self.p.peek16(SCC1R1) & (PE | M) != (PE | M):
+                if not self.frame_mismatch:
+                    print(f"sci: byte sent with SCC1R1=0x{self.p.peek16(SCC1R1):04x}, "
+                          "not 8E1 (PE|M): a real tester reads it garbled",
+                          file=sys.stderr)
+                self.frame_mismatch += 1
             self.tx.append(value & 0xFF)
             if self.on_tx is not None:
                 self.on_tx(value & 0xFF)
             # The K line is one wire: the transmitter hears its own byte,
             # and this driver sends the next one from that receive interrupt.
+            if self.model_overrun:
+                start = max(self.now(), self.tx_free_at)
+                self.tx_free_at = start + int(byte_seconds(self.p.peek16(SCC1R0)) * self.ips)
+                if not self.rx_queue:
+                    self.rx_next_at = max(self.rx_next_at, self.tx_free_at)
+                self.rx_queue.append(value & 0xFF)
+                self.p.poke16(SC1SR, self.p.peek16(SC1SR) & ~(TDRE | TC))
+                return None
             self.rx_queue.append(value & 0xFF)
         # The byte leaves at once as far as the program can tell.
         self.p.poke16(SC1SR, self.p.peek16(SC1SR) | TDRE | TC)
@@ -77,12 +119,22 @@ class Sci:
 
     def service(self):
         """Present the next received byte when its byte time has passed."""
+        if self.model_overrun and self.now() >= self.tx_free_at:
+            sr = self.p.peek16(SC1SR)
+            if not sr & TDRE:
+                self.p.poke16(SC1SR, sr | TDRE | TC)
         if not self.rx_queue or self.now() < self.rx_next_at:
             return
         if not self.p.peek16(SCC1R1) & RE:
             self.rx_queue.clear()
             return
         sr = self.p.peek16(SC1SR)
+        if sr & RDRF and self.model_overrun:
+            self.rx_queue.pop(0)
+            self.overruns += 1
+            self.p.poke16(SC1SR, sr | OR)
+            self.rx_next_at = self.now() + int(byte_seconds(self.p.peek16(SCC1R0)) * self.ips)
+            return
         if sr & RDRF:
             # The program has not taken the last byte yet. On the wire that
             # would be an overrun; here it only means the emulated CPU is

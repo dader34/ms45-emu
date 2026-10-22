@@ -144,7 +144,18 @@ class Cpu:
             self.rfi_sites |= find_rfi(image, base)
         self.msr_sprs = {a: v[1] for a, v in self.trap_sites.items() if v[0] == "msr"}
         self.sc_sites = {}                    # pc after the sc -> site description
+        self.patched = {}                     # address -> original word, for flash_pair
         self._patch_trap_sites()
+
+    def _patch(self, at, word):
+        """Write an emulator patch word, remembering the original: the site
+        patches land in the flash chip's own image (one mapping), and a
+        snapshot (Board.flash_pair) has to carry real silicon bytes, not
+        stub branches a re-booted board would chase into an empty stub page."""
+        at &= 0xFFFFFFFF
+        if at not in self.patched:
+            self.patched[at] = self.m.read32(at)
+        self.m.write32(at, word)
 
     def _patch_trap_sites(self):
         m = self.m
@@ -158,12 +169,13 @@ class Cpu:
             sites = [pc] + ([pc - 0x100000] if pc >= 0xFFF00000 else [])   # and the 0xFFExxxxx mirror
             for at in sites:
                 if site[0] == "msr":
-                    m.write32(at, _ba(self._msr_stub(site[1], at + 4)))
+                    self._patch(at, _ba(self._msr_stub(site[1], at + 4)))
                 else:
-                    m.write32(at, SC)
+                    self._patch(at, SC)
                     self.sc_sites[(at + 4) & 0xFFFFFFFF] = site
-        self.siu_window_sites, self.sipend_store_sites = relocate_siu_window(m, self.sc_sites, self.images)
-        self.msr_const_sites = clear_relocation_bits(m, self.images)
+        self.siu_window_sites, self.sipend_store_sites = relocate_siu_window(
+            m, self.sc_sites, self.images, self._patch)
+        self.msr_const_sites = clear_relocation_bits(m, self.images, self._patch)
         if self.program:
             from .checksums import refresh_program_sums
             refresh_program_sums(m)
@@ -435,10 +447,11 @@ def find_siu_window_sites(image, base):
     return sites, sipend_stores
 
 
-def relocate_siu_window(m, sc_sites, images):
+def relocate_siu_window(m, sc_sites, images, patch=None):
     """Patch the `lis rX, 0x30` sites so the window lives at SIU_SHADOW,
     and make the program's SIPEND stores `sc` no-ops (they clear edge
     requests on hardware; in RAM they would stick)."""
+    write = patch or m.write32
     sites, stores = [], []
     for base, image in images:
         a, st = find_siu_window_sites(image, base)
@@ -448,18 +461,19 @@ def relocate_siu_window(m, sc_sites, images):
     for at in sites:
         for a in ([at, at - 0x100000] if at >= 0xFFF00000 else [at]):
             w = m.read32(a)
-            m.write32(a, (w & 0xFFFF0000) | SIU_SHADOW_LIS)
+            write(a, (w & 0xFFFF0000) | SIU_SHADOW_LIS)
     for at in stores:
         for a in ([at, at - 0x100000] if at >= 0xFFF00000 else [at]):
-            m.write32(a, SC)
+            write(a, SC)
             sc_sites[(a + 4) & 0xFFFFFFFF] = ("nop",)
     return sites, stores
 
 
-def clear_relocation_bits(m, images):
+def clear_relocation_bits(m, images, patch=None):
     """`li rX, imm; mtmsr rX` with IR/DR in imm: the MPC555 has no MMU and
     ignores them, Unicorn's core would start translating. Clear them in
     the constant."""
+    write = patch or m.write32
     sites = []
     for base, buf in images:
         for a in range(0, len(buf) - 4, 4):
@@ -468,6 +482,6 @@ def clear_relocation_bits(m, images):
             if (w >> 26 == 14 and (w >> 16) & 31 == 0 and w & MSR_IR_DR
                     and w2 >> 26 == 31 and (w2 >> 1) & 0x3FF == 146 and (w >> 21) & 31 == (w2 >> 21) & 31):
                 for at in ([base + a, base + a - 0x100000] if base else [a]):
-                    m.write32(at, w & ~MSR_IR_DR)
+                    write(at, w & ~MSR_IR_DR)
                 sites.append(base + a)
     return sites

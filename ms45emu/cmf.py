@@ -9,8 +9,10 @@ the remaining 192 KB, each in 32 KB blocks. The driver is Motorola's:
            block, EHV pulses until the margin read of the page is all zero
   both     refused (driver error 0x87) unless CMFCTL[EPEE] reads 1
 
-Pulses are not timed here: the first one does the whole job. After a
-program pulse the hardware shows the *program margin read* while SES is
+Pulses are not timed here: the first one does the whole job, and HVS
+(CMFCTL bit 31, high voltage on) then reads 1 for HV_READS reads of
+CMFCTL, or until EHV is written back to 0 -- enough to catch a driver
+that goes on before the pulse is over. After a program pulse the hardware shows the *program margin read* while SES is
 still set: a 1 for every bit that still needs programming, so all zeros
 when it is done. That view is put into the emulator's memory for the
 written pages and replaced by the real content when SES is cleared.
@@ -23,6 +25,7 @@ CMF_A, CMF_B = 0x2FC800, 0x2FC840
 CMFMCR, CMFTST, CMFCTL = 0x0, 0x4, 0x8
 HVS, EPEE, PE, SES, EHV = 0x80000000, 0x20, 0x4, 0x2, 0x1
 BLOCK_SHIFT, BLOCK_SIZE, PAGE_SIZE = 8, 0x8000, 0x40
+HV_READS = 20                             # CMFCTL reads HVS stays up after an EHV rise
 
 
 class Cmf:
@@ -35,18 +38,40 @@ class Cmf:
         self.modules = {CMF_A: 0x00000, CMF_B: 0x40000}     # register base -> array offset
         self.latched = {base: {} for base in self.modules}  # address -> (size, value)
         self.margin = {base: set() for base in self.modules}
+        self.hvs = {base: 0 for base in self.modules}       # CMFCTL reads HVS still shows
         self.erases = 0
         self.programs = 0
         self.log = []
         for base in self.modules:
             page.on_read(base + CMFCTL, self._ctl_read)
             page.on_write(base + CMFCTL, self._ctl_write)
+        # array reads made while a module's EHV is set: on silicon that is
+        # a transfer error (machine check) -- the car reset on the fast
+        # flasher's first MPC erase, whose poll read the block mid-pulse.
+        # Opt-in (watch_hv_reads), the hook costs on every array read.
+        self.hv_reads = []
+
+    def watch_hv_reads(self):
+        """Record (pc, addr) of every array read while EHV is set."""
+        from unicorn import UC_HOOK_MEM_READ
+        from unicorn.ppc_const import UC_PPC_REG_PC
+
+        def hook(uc, access, addr, size, value, _):
+            for base in self.modules:
+                if self.p.peek32(base + CMFCTL) & EHV:
+                    self.hv_reads.append((uc.reg_read(UC_PPC_REG_PC), addr))
+                    return
+        self.m.mu.hook_add(UC_HOOK_MEM_READ, hook, begin=0, end=self.size - 1)
 
     # ---- registers --------------------------------------------------------
     def _ctl_read(self, addr, size):
         if size != 4:
             return None
+        base = addr - CMFCTL
         v = self.p.peek32(addr) & ~(HVS | EPEE)
+        if self.hvs[base]:
+            self.hvs[base] -= 1
+            v |= HVS
         return v | (EPEE if self.epee() else 0)
 
     def _ctl_write(self, addr, size, value):
@@ -57,7 +82,10 @@ class Cmf:
         value &= ~(HVS | EPEE)
         if value & SES and not old & SES:
             self.latched[base].clear()
+        if not value & EHV:
+            self.hvs[base] = 0
         if value & EHV and not old & EHV and value & SES and self.epee():
+            self.hvs[base] = HV_READS
             if value & PE:
                 self._erase(base, (value >> BLOCK_SHIFT) & 0xFF)
             else:

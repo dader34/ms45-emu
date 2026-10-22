@@ -6,6 +6,7 @@ registers are MMIO (Python is called only on register access), the few
 hundred EIE/EID/rfi sites have their own code hooks, and interrupts are
 delivered at those sites and at slice boundaries.
 """
+import struct
 from collections import Counter
 
 from unicorn import (UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE_UNMAPPED, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_MEM_WRITE_PROT, UC_PROT_EXEC,
@@ -108,7 +109,7 @@ class OpenBus:
 
 
 class Board:
-    def __init__(self, pair, patch_program=True, mips=40):
+    def __init__(self, pair, patch_program=True, mips=40, waits=None):
         """patch_program=False prepares only the boot loader for emulation
         and leaves the program's bytes alone (see Cpu): for a DME that
         will stay in the loader.
@@ -119,6 +120,9 @@ class Board:
         than real time, which is what a tester on a real clock needs."""
         self.m = Machine(pair, periph_ram=False)
         m = self.m
+        self.waits = []                                   # set_waits: spins the emulator may skip
+        self._skip = None                                 # (head pc, target instructions) once one is
+        self._skip_budget = 0
         self.mips = mips
         self.ips = mips * 1_000_000                       # instructions per second
         self.clocks_per_tick = self.ips // TB_HZ          # instructions per time base unit
@@ -142,6 +146,11 @@ class Board:
         self.watchdog_services = 0
         self.watchdog_bad = 0
         self._wd_expect = 0
+        # the longest run of instructions between two services: the car's
+        # loader arms a 100 ms watchdog (SYPCR 0x07A17F87) the emulator does
+        # not fire, so a loop that never services it only shows up here
+        self.watchdog_last = 0
+        self.watchdog_max_gap = 0
         self.siu.on_write(SWSR, self._swsr_write)
         # TBSCR status bits are write-1-to-clear; the rest is a control register.
         self.siu.on_write(TBSCR, lambda a, size, value: (self.siu.peek16(TBSCR) & ~(value & (TB_REFA | TB_REFB))) & 0xFF3F | (value & 0xFF3F) if size == 2 else None)
@@ -244,6 +253,8 @@ class Board:
         self.probe_counts = Counter()
         self.traps = 0
         m.mu.hook_add(UC_HOOK_INTR, self._intr)
+        if waits:
+            self.set_waits(waits)
         # the live-tune transport's watch (op 09) needs the data breakpoint
         self.breakpoint = None
         if patch_program:
@@ -331,10 +342,23 @@ class Board:
             self._wd_expect ^= 1
             if self._wd_expect == 0:
                 self.watchdog_services += 1
+                gap = self.instructions - self.watchdog_last
+                self.watchdog_max_gap = max(self.watchdog_max_gap, gap)
+                self.watchdog_last = self.instructions
         else:
             self.watchdog_bad += 1
             self._wd_expect = 0
         return None
+
+    def watchdog_window(self):
+        """Start measuring service gaps from here (e.g. once the body runs)."""
+        self.watchdog_last = self.instructions
+        self.watchdog_max_gap = 0
+
+    def watchdog_gap_ms(self):
+        """The longest service gap since watchdog_window(), in DME ms."""
+        gap = max(self.watchdog_max_gap, self.instructions - self.watchdog_last)
+        return gap * 1000 / self.ips
 
     def _hsrr_write(self, addr, size, value):
         if value:
@@ -539,6 +563,8 @@ class Board:
         # arrive stretched past the DME's inter-byte timeout.
         if self.sci.rx_queue:
             n = min(n, max(self.sci.rx_next_at - self.instructions, 0) + self.clocks_per_tick)
+        if self.sci.model_overrun and self.sci.tx_free_at > self.instructions:
+            n = min(n, self.sci.tx_free_at - self.instructions + self.clocks_per_tick)
         return max(n, 64)
 
     def _slice_boundary(self, ran):
@@ -657,9 +683,21 @@ class Board:
         return self.run_from(RESET_ENTRY, max_insns, until)
 
     def flash_pair(self):
-        """What the two flash memories hold now, without the emulator's patches."""
+        """What the two flash memories hold now, without the emulator's patches.
+        The CPU's site patches (stub branches, sc traps) live in the chip's
+        own image; put the original words back into the copy, so a board
+        booted from this pair re-finds its EIE/EID sites instead of chasing
+        stale stub branches into an empty stub page. The running board is
+        not touched."""
         from .image import Pair
-        return Pair(bytes(self.flash.image), bytes(self.cmf.image), self.m.pair.name, check_program=False)
+        flash, mpc = bytearray(self.flash.image), bytearray(self.cmf.image)
+        for at, word in self.cpu.patched.items():
+            at &= 0xFFFFFFFF
+            if at < len(mpc):
+                struct.pack_into(">I", mpc, at, word)
+            elif 0xFFF00000 <= at < 0xFFF00000 + len(flash):
+                struct.pack_into(">I", flash, at - 0xFFF00000, word)
+        return Pair(bytes(flash), bytes(mpc), self.m.pair.name, check_program=False)
 
     def program_valid(self):
         """Whether the loader will start the program at the next reset:
@@ -672,16 +710,74 @@ class Board:
         """The DME after a reset: a new board on the flash contents as
         they are now, with this one's EEPROM and inputs. Boot it with
         reset_vector=True to have the loader decide what runs."""
-        b = Board(self.flash_pair(), patch_program=self.program_valid(), mips=self.mips)
+        b = Board(self.flash_pair(), patch_program=self.program_valid(), mips=self.mips, waits=self.waits)
         b.load_eeprom(self.eeprom_image())
         b.adc_a.channels.update(self.adc_a.channels)
         b.adc_b.channels.update(self.adc_b.channels)
         return b
 
+    # ---- skipping the flasher's spins ---------------------------------------
+    # Every peripheral register is MMIO, so a loop that polls one calls into
+    # Python on every pass: the resident flasher's byte wait (lhz SC1SR /
+    # andi. / bne / two sth to SWSR / b) runs at ~3.5 M instructions a second
+    # here against 69 M for the same loop on plain memory (measured; the
+    # per-call cost is ~0.7 us), which is 480 Python calls per byte at 115200
+    # and the whole reason a fast flash is no faster than a stock one on the
+    # emulator. The CPU does nothing useful while it spins, and on silicon
+    # time simply passes, so the board skips the spin: a hook on the loop's
+    # head stops the slice when the loop has nothing to do and the DME's time
+    # is advanced to the moment it would have found something (the next byte;
+    # the end of a countdown). Only kline opts in (set_waits); the hook also
+    # checks the instruction word at the head, so a program that happens to
+    # run at that SRAM address is left alone.
+    def set_waits(self, waits):
+        """[(pc, word, kind, reg, per_pass)]: 'rx' waits for the SCI's next
+        byte; 'spin' is a countdown in register `reg` of `per_pass`
+        instructions a pass, left with the passes the skip did not cover."""
+        from unicorn import UC_HOOK_CODE
+        self.waits = list(waits or [])
+        for w in self.waits:
+            self.m.mu.hook_add(UC_HOOK_CODE, self._wait_hook, user_data=w, begin=w[0], end=w[0])
+
+    def _wait_hook(self, uc, pc, size, w):
+        from unicorn.ppc_const import UC_PPC_REG_0
+        from .sci import SC1SR, RDRF
+        if self._skip is not None or int.from_bytes(uc.mem_read(pc, 4), "big") != w[1]:
+            return
+        kind, reg, per_pass = w[2], w[3], w[4]
+        if kind == "rx":
+            if self.sci.p.peek16(SC1SR) & RDRF:
+                return                                    # a byte is there: the loop ends by itself
+            # the next byte's moment, or the rest of this slice when nothing is coming
+            target = self.sci.rx_next_at if self.sci.rx_queue else None
+            if reg:
+                # a countdown bounds the wait (the body's inter-byte timeout):
+                # step it down with the skip and never jump past its zero, so
+                # the timeout can still fire -- and never past the slice's end,
+                # so the clocks step as they always do
+                k = uc.reg_read(UC_PPC_REG_0 + reg)
+                bound = self.instructions + min(k * per_pass, self._skip_budget)
+                target = bound if target is None else min(target, bound)
+                if target <= self.instructions:
+                    return
+                uc.reg_write(UC_PPC_REG_0 + reg, k - (target - self.instructions) // per_pass)
+            self._skip = (pc, target)
+        else:
+            k = uc.reg_read(UC_PPC_REG_0 + reg)
+            # at most a slice's worth per skip, so the clocks step as they always do
+            k_skip = min(k - 1, max(self._skip_budget // per_pass, 1))
+            if k_skip <= 0:
+                return
+            uc.reg_write(UC_PPC_REG_0 + reg, k - k_skip)
+            self._skip = (pc, self.instructions + k_skip * per_pass)
+        uc.emu_stop()
+
     def run_from(self, pc, max_insns, until=BOOT_IDLE):
+        from unicorn.ppc_const import UC_PPC_REG_PC
         done = 0
         while done < max_insns:
             n = self._slice_length()
+            self._skip_budget = n
             try:
                 pc = self.m.run(pc, until, max_insns=n)
             except UcError as e:
@@ -693,6 +789,19 @@ class Board:
                     pc = self.m.pc
                     continue
                 return False, f"{e} at pc=0x{self.m.pc:X}"
+            if self._skip is not None:
+                head, target = self._skip
+                self._skip = None
+                # the spin's time passes without being executed; the loop
+                # resumes at its head, where it now finds what it waited for
+                ran = n if target is None else max(target - self.instructions, self.clocks_per_tick)
+                self.m.mu.reg_write(UC_PPC_REG_PC, head)
+                done += ran
+                # every skipped loop services the watchdog each pass (its head
+                # is the SWSR store the wait hook keys on): the skip is no gap
+                self.watchdog_last = self.instructions + ran      # where the skip ends
+                pc = self.m.pc if self._slice_boundary(ran) else head
+                continue
             done += n
             if pc == until:
                 return True, "idle"

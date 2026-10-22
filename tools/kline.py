@@ -85,6 +85,7 @@ import json
 import os
 import select
 import socket
+import struct
 import sys
 import termios
 import time
@@ -103,6 +104,7 @@ SLICE_SECONDS = 0.0025   # DME time between looks at the line
 P3_CATCH_UP_SECONDS = 0.05   # the most DME time made up before a request is heard (P3min is 12 ms)
 PTY_ACTIVE_SECONDS = 120
 RESET_ANSWER = bytes.fromhex("B8F11201510B")   # positive response to STEUERGERAETE_RESET (11 01)
+RESET_GRACE_SECONDS = 0.3        # wall clock the DME stands between reset answer and reboot
 TURBO_ANSWER_SECONDS = 0.1   # --turbo: DME time to wait for an answer to start (some requests get none)
 TURBO_LIMIT_SECONDS = 2.0    # ... and to wait for one that has started to finish
 AFTER_RUN_LIMIT_SECONDS = 90 # ignition off: DME time the after-run gets before the main relay drops anyway
@@ -254,6 +256,12 @@ class WebSocket:
     file over plain HTTP). Either way the client says which baud rate it
     has its port set to; `baud` is that.
 
+    setSignals' break is honoured: the tester holding the line low across
+    a reset is what the quick-flash gate watches for (docs/fast-flasher.md),
+    so `break_wanted` is re-applied to the board's SCI every loop turn and
+    before each reboot -- a board created fresh by a reset must never boot
+    with the line forgotten high.
+
     The port also takes the ignition switch over plain HTTP: /ignition/on,
     /off and /toggle are left in `commands` for the bridge, which keeps
     `ignition` at what the switch is."""
@@ -272,6 +280,7 @@ class WebSocket:
         self.baud = None
         self.ignition = True
         self.commands = []                # ignition on (True) / off (False), as asked for over HTTP
+        self.break_wanted = False         # setSignals {break}: the tester holds the line low
         self.pending = []                 # [conn, request so far, since]: connections not yet served
 
     def fileno(self):
@@ -429,7 +438,16 @@ class WebSocket:
         elif op == "getSignals":
             # the cable reports the ignition (KL15) on DSR/DCD
             reply["signals"] = {"dataSetReady": self.ignition, "dataCarrierDetect": self.ignition, "clearToSend": False}
-        elif op != "setSignals":
+        elif op == "setSignals":
+            want = (msg.get("signals") or {}).get("break")
+            if want is not None:
+                self.break_wanted = bool(want)
+                # the break's timing against the reset is what decides the
+                # quick-flash gate, so a miss has to be visible in the log
+                print(f"{time.strftime('%H:%M:%S')}."
+                      f"{int(time.time() * 1000) % 1000:03d} tester: break "
+                      f"{'held' if self.break_wanted else 'released'}", flush=True)
+        else:
             reply = {"id": msg.get("id"), "ok": False, "error": f"unknown call {op}"}
         self._send(0x1, json.dumps(reply).encode())
 
@@ -761,6 +779,8 @@ def main():
     ap.add_argument("--rpm", type=float, default=0, help="turn the crank at this speed (default 0: ignition on, engine off)")
     ap.add_argument("--mips", type=int, default=10,
                     help="million instructions per second of DME time (default 10: real time; 40: a truer CPU, 4x slow)")
+    ap.add_argument("--no-fast-wait", action="store_true",
+                    help="execute the fast flasher's polling spins instead of skipping them (today's slow timings)")
     ap.add_argument("--turbo", action="store_true",
                     help="do not wait for the wall clock while a telegram is being taken and answered")
     ap.add_argument("--diag", action="store_true",
@@ -782,7 +802,8 @@ def main():
     if args.adapter_ws:
         lines.append(Adapter(args.adapter_ws, websocket=True))
     print("K line on " + ", ".join(line.name for line in lines)
-          + (f" (also {args.link})" if args.link and not args.port else ""), flush=True)
+          + (f" (also {args.link})" if args.link and not args.port else "")
+          + f" [reset grace {RESET_GRACE_SECONDS} s]", flush=True)
 
     fold_reset_pcs = ()                # the live-tune fold's self-reset spin (see the loop)
     if args.pair == "livetune":
@@ -836,6 +857,44 @@ def main():
     # rate has to be the one at the moment of sending, not at delivery.
     out = []
     board.sci.on_tx = lambda byte: out.append((byte, dme_baud(board)))
+    # The flasher park and the spins to skip are set up BEFORE the first boot:
+    # unicorn ignores a code hook added after an instance has run, so a wait
+    # armed later would be inert on this board (the ones after a reset are
+    # fresh instances and would still work -- which hid exactly that once).
+    # The flasher body's RESET ends the same way the fold's save does: a spin
+    # with the watchdog unserviced, waiting for the chip to reset. The body
+    # may arrive by any route (an MS45_FLASH image, or BMWeb's own install
+    # writing it in a session), so the park is watched unconditionally; a
+    # stock program has no business pinned on that one SRAM word for ten
+    # slices straight.
+    park_pc = None
+    body_lo = body_hi = None                        # the body's SRAM range, when an image carries one
+    park_mark_at = None                             # ext offset where an image carries its own park PC
+    try:
+        import flasher_body
+        flasher_body.build_parts()                  # fills PARK_PC (the body the install was built from)
+        park_pc = flasher_body.PARK_PC
+        body_lo, body_hi = flasher_body.SRAM_BASE, flasher_body.SRAM_BASE + flasher_body.REPLY_OFF
+        try:
+            from flasher_gate import PARK_MARK_AT
+            park_mark_at = PARK_MARK_AT
+        except ImportError:
+            pass                                    # older gate: images carry no park word
+        print(f"flasher RESET park at {park_pc:#x} (watchdog stand-in)", flush=True)
+        if not args.no_fast_wait:
+            # The body's spins, skipped rather than executed (Board.set_waits):
+            # the byte wait and the reply gap (the CMF waits are the loader's
+            # driver's own now, and the emulator's Cmf answers it at once).
+            # Each is named by its head's SRAM address and the instruction
+            # word there.
+            la = flasher_body.LABEL_ADDRS
+            waits = [(la["rx_wait"], 0xA09C0000, "rx", 3, 7),                  # lhz r4,0(r28); a 7-insn pass,
+                     (la["reply_gap"], 0xB2510000, "spin", 3, 4)]              #   countdown in r3 = the rx timeout
+            board.set_waits(waits)
+            print("fast wait: the flasher's byte and erase spins are skipped, not run (--no-fast-wait to run them)", flush=True)
+    except (ImportError, ValueError, KeyError) as e:
+        print(f"no flasher park to watch ({e})", flush=True)
+
     print("booting...", flush=True)
     if saved:
         print("resuming on the saved flash; the DME will start "
@@ -863,26 +922,56 @@ def main():
         return time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
     answer = bytearray()               # the DME's bytes since that telegram
     answer_by = None                   # DME times by which the answer has to have started, and finished
+    pending_reset = None               # a reset answer sent; reboot next turn, after the tester's reads
     ignition = True                    # KL15
     powered = True                     # False once the main relay has dropped: the CPU stands still
     off_at, parked = 0, 0              # DME time of ignition off, and looks in a row that found the program parked
     fold_spin = 0                      # slices in a row the PC sat in the fold's post-save reset spin
+    flasher_spin = 0                   # ... and in the flasher body's post-RESET park
+
+    def park_pcs():
+        """The park addresses to watch. The source's own is one (a body that
+        was already running when this process started parks there for the
+        process's life); the LIVE image's park word is the other -- a body the
+        app flashed since may be a different build, sized differently, parking
+        elsewhere (the park moves with the body; watching the launch-time PC
+        alone went stale the moment an upgrade landed mid-process)."""
+        pcs = {park_pc}
+        if park_mark_at is not None:
+            w, = struct.unpack_from(">I", board.flash.image, park_mark_at)
+            if body_lo is not None and body_lo <= w < body_hi:
+                pcs.add(w)                           # blank/v1 images read 0xFFFFFFFF: out of range
+        return pcs
+    gate_said = False                               # this boot's gate verdict has been logged or not
+    boot_break = False                              # whether the line was held when this boot started
     active_at = time.time()            # wall time of the latest tester bytes or command (--idle-timeout)
+
+    def apply_break():
+        """The tester's break onto the current board's line -- the quick-flash
+        gate watches the line from the first microseconds after a reset, so
+        this runs before every boot and every slice, never once at set-up."""
+        nonlocal board
+        board.sci.line_hold = any(getattr(line, "break_wanted", False) for line in lines)
 
     def reset_board(why):
         """A new board on what the flash and the EEPROM hold now, started from the reset vector."""
-        nonlocal board, epoch, in_flight, off_at, parked, fold_spin, said
+        nonlocal board, epoch, in_flight, off_at, parked, fold_spin, flasher_spin, said
+        nonlocal gate_said, boot_break
         board = board.reset()
         said = None
         board.ignition(ignition)
         board.sci.on_tx = lambda byte: out.append((byte, dme_baud(board)))
+        apply_break()
+        gate_said = False
+        boot_break = board.sci.line_hold
         state = "its program" if board.cpu.program else "the boot loader: nothing valid to run"
-        print(f"{why}; it will start {state}", flush=True)
+        held = ", the line held low (quick-flash watch)" if boot_break else ""
+        print(f"{why}; it will start {state}{held}", flush=True)
         board.boot(max_insns=slice_instructions, reset_vector=True)
         board.crank.rpm = args.rpm
         epoch = (time.time(), board.instructions)
         in_flight = False
-        off_at, parked, fold_spin = 0, 0, 0
+        off_at, parked, fold_spin, flasher_spin = 0, 0, 0, 0
 
     def power_off(why):
         nonlocal powered, in_flight
@@ -986,6 +1075,10 @@ def main():
                             print(f"{time.strftime('%H:%M:%S')} {what} {value:g}", flush=True)
                         else:
                             set_ignition(command)
+            if pending_reset is not None and time.time() >= pending_reset[1]:
+                reset_board(pending_reset[0])
+                pending_reset = None
+                continue
             if args.idle_timeout and time.time() - active_at > args.idle_timeout:
                 idle = f"{args.idle_timeout / 60:g} min" if args.idle_timeout >= 60 else f"{args.idle_timeout:g} s"
                 print(f"{stamp()} nothing from a tester for {idle}: quitting", flush=True)
@@ -1001,6 +1094,19 @@ def main():
                           f"{' with a request waiting' if asked_at else ''}", flush=True)
                 last_turn = turn
             board.run(slice_instructions)
+            apply_break()                           # a break asked for mid-slice holds from the next one
+            # The gate's verdict: the body sits in its own SRAM range for the
+            # whole session, so a slice landing there means the gate took the
+            # flasher branch; the program taking over instead, with the line
+            # still held from the reset, means it never saw the break.
+            if not gate_said and body_lo is not None:
+                if body_lo <= board.m.pc < body_hi:
+                    gate_said = True
+                    print(f"{stamp()} quick-flash entry: the flasher body is running", flush=True)
+                elif boot_break and not board.in_loader:
+                    gate_said = True
+                    print(f"{stamp()} quick-flash MISS: the line was held across the reset "
+                          f"but the program started anyway", flush=True)
             if watch and time.time() - last_turn > 0.15:
                 print(f"{stamp()} watch: one slice of the DME took {(time.time() - last_turn) * 1000:.0f} ms", flush=True)
             # The live-tune fold ends in a watchdog self-reset: it spins at
@@ -1016,6 +1122,19 @@ def main():
                     continue
             else:
                 fold_spin = 0
+            # The flasher body's RESET is the same story: it parks with the
+            # watchdog unserviced and the chip comes back on the new marks.
+            # Ten slices, not two: the park is watched on every image, so a
+            # passing program must not trip it.
+            parks = park_pcs()
+            if parks and board.m.pc in parks:
+                flasher_spin += 1
+                if flasher_spin >= 10:
+                    flasher_spin = 0
+                    reset_board("flasher RESET: the watchdog reset")
+                    continue
+            else:
+                flasher_spin = 0
             if not ignition:
                 # The program parks in RAM when its after-run is done and
                 # waits for the main relay to let go of it.
@@ -1051,7 +1170,21 @@ def main():
                 out.clear()
                 if sent == RESET_ANSWER:
                     sent.clear()
-                    reset_board("DME reset")
+                    # A real DME reboots a moment after its reset answer, and
+                    # the tester uses exactly that moment to assert the break
+                    # the quick-flash gate watches for. The next loop turn
+                    # (~50 ms) is TIGHTER than the real thing: a real DME
+                    # stands 200-600 ms between answer and reset, and a
+                    # localhost tester that breaks on reading the answer
+                    # arrives well inside that. Model the real grace, or the
+                    # emulator eats the break the hardware would have seen.
+                    # The FIRST answer anchors the deadline: the DME keeps
+                    # retransmitting its unanswered answer (~60 ms apart) while
+                    # the tester holds the break, and a retransmit re-arming it
+                    # would push the reboot out forever — it never comes due.
+                    if pending_reset is None:
+                        pending_reset = ("DME reset", time.time() + RESET_GRACE_SECONDS)
+                        print(f"{stamp()} reset answer: reboot in {RESET_GRACE_SECONDS} s", flush=True)
             if in_flight:
                 if len(answer) >= 4 and len(answer) >= answer[3] + 5:
                     in_flight = False                         # a whole telegram: B8 <to> <from> <len> <data> <xor>
