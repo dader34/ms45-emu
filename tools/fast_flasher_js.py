@@ -102,7 +102,13 @@ def render_js(runs, hook):
         "  runs: [",
     ]
     for off, b in runs:
-        lines.append(f"    [0x{off:05x}, '{b.hex()}'],")
+        # prettier's shape (BMWeb's format check gates its deploy): a run on
+        # one line when it fits in 80 columns, else one element per line
+        line = f"    [0x{off:05x}, '{b.hex()}'],"
+        if len(line) <= 80:
+            lines.append(line)
+        else:
+            lines += ["    [", f"      0x{off:05x},", f"      '{b.hex()}',", "    ],"]
     lines += [
         "  ],",
         "};",
