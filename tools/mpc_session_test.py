@@ -24,7 +24,7 @@ from ms45emu.image import load_named, Pair                         # noqa: E402
 from ms45emu.board import Board, RESET_ENTRY                       # noqa: E402
 from ms45emu.checksums import crc32_mpeg2                          # noqa: E402
 from flasher_gate import build, ENTRY_CPU, STAMP_AT, stamp_bytes   # noqa: E402
-from flasher_body import SRAM_BASE, REPLY_OFF, MPC_WINDOW          # noqa: E402
+from flasher_body import SRAM_BASE, REPLY_OFF, MPC_WINDOW, CRC_TABLE, STACK_TOP   # noqa: E402
 from flasher_session_test import Session, frame, lit_nrv2b, expect, expect_nak, fast_waits
 
 CHUNK = 4096
@@ -76,12 +76,29 @@ def main():
     if not s.until(lambda: len(board.sci.tx) >= 21):
         raise SystemExit("FAIL: no HELLO after the break released")
     hello = bytes(board.sci.tx[:21])
-    if hello != frame(0x40, stamp_bytes(7, 1)):
+    if hello != frame(0x40, stamp_bytes(8, 1)):
         raise SystemExit(f"FAIL: HELLO mismatch: {hello.hex()}")
     print(f"hello: {hello[4:10].decode()} v{hello[10]} flags {hello[11]:#04x}")
     board.watchdog_window()                      # the body runs from here
     board.sci.model_overrun = True               # the real SCI drops, it does not wait
     board.cmf.watch_hv_reads()                   # silicon faults an array read mid-pulse
+    # stack watermark: the room between the CRC table and the stack top
+    WM_LO, WM_HI = CRC_TABLE + 0x400, STACK_TOP - 0x20
+    board.m.mu.mem_write(WM_LO, b"\xa5" * (WM_HI - WM_LO))
+    SCC1R0 = 0x305008
+
+    # ---- SET_BAUD: switch, hold, and the silent fallback ---------------
+    expect(s.xfer(0x07, struct.pack(">H", 5)), 0x07, "SET_BAUD to SCBR 5 (250 kbaud)")
+    if board.imb.peek16(SCC1R0) != 5:
+        raise SystemExit(f"FAIL: SCBR after SET_BAUD is {board.imb.peek16(SCC1R0)}, want 5")
+    expect(s.xfer(0x00), 0x00, "HELLO at 250 kbaud")
+    expect(s.xfer(0x01, struct.pack(">II", 0x40000, 0x1000)), 0x01, "QUERY at 250 kbaud")
+    expect(s.xfer(0x07, struct.pack(">H", 4)), 0x07, "SET_BAUD to SCBR 4, then silence")
+    if not s.until(lambda: board.imb.peek16(SCC1R0) == 11, budget=200_000_000):
+        raise SystemExit(f"FAIL: the body did not fall back to 115200 (SCBR {board.imb.peek16(SCC1R0)})")
+    print("  ok: silent after SET_BAUD: the body fell back to 115200 by itself")
+    expect(s.xfer(0x00), 0x00, "HELLO at 115200 after the fallback")
+    expect_nak(s.xfer(0x07, struct.pack(">H", 0)), 0x07, 6, "SET_BAUD 0 refused")
 
     # ---- the window's permission edges ----------------------------------
     expect_nak(s.xfer(0x02, struct.pack(">I", MPC_WINDOW | 0x70000)), 0x02, 1,
@@ -128,13 +145,44 @@ def main():
        cpu_view(board, 13 * BLOCK + 0x90, 0x3F0) != b"\xff" * 0x3F0:
         raise SystemExit("FAIL: staging disturbed bytes outside the spans")
 
-    # ---- the full push, in the contract order ---------------------------
-    # blocks 13..1, then 0 last; each ERASE + 8 CHUNKs of stock content
-    for blk in list(range(13, 0, -1)) + [0]:
-        expect(s.xfer(0x02, struct.pack(">I", MPC_WINDOW | blk * BLOCK)), 0x02,
-               f"ERASE of MPC block {blk}")
-        push_chunks(s, board, MPC_WINDOW | blk * BLOCK,
-                    stock.mpc[blk * BLOCK:(blk + 1) * BLOCK], f"block {blk}")
+    # ---- the full push: blocks 13..1 as pagesets, block 0 last ---------
+    block0_before = bytes(board.cmf.image[:BLOCK])
+    expect_nak(s.xfer(0x02, struct.pack(">IH", MPC_WINDOW | BLOCK, 0x4002)), 0x02, 6,
+               "ERASE with a block beyond 13 in the mask refused")
+    t_par = board.instructions
+    expect(s.xfer(0x02, struct.pack(">IH", MPC_WINDOW | BLOCK, 0x3FFE)), 0x02,
+           "ERASE of MPC blocks 13..1 in one job")
+    if board.cmf.image[BLOCK:14 * BLOCK] != b"\xff" * (13 * BLOCK):
+        raise SystemExit("FAIL: blocks 13..1 not blank after the mask ERASE")
+    if bytes(board.cmf.image[:BLOCK]) != block0_before:
+        raise SystemExit("FAIL: the mask ERASE touched block 0")
+    print(f"  ok: mask ERASE: {len({a for k, a, _ in board.cmf.log if k == 'erase'})} blocks, one job")
+    MASK, PAGES = 0x3FFE, 4                      # 13 blocks x 4 pagesets x 64 = 3328 B
+    blocks = [b for b in range(14) if MASK >> b & 1]
+    bad = struct.pack(">HHHHIB3x", MASK, 0, 3328 - 64, 1, 0, PAGES)
+    expect_nak(s.xfer(0x08, bad + b"\x00"), 0x08, 6, "CHUNK_SET with declen != pages x blocks x 64 refused")
+    n = 0
+    for off in range(0, BLOCK, PAGES * 64):
+        plain = b"".join(stock.mpc[b * BLOCK + off + p * 64:b * BLOCK + off + p * 64 + 64]
+                         for p in range(PAGES) for b in blocks)
+        comp = lit_nrv2b(plain)
+        hdr = struct.pack(">HHHHIB3x", MASK, off, len(plain), len(comp), crc32_mpeg2(comp), PAGES)
+        fr = s.xfer(0x08, hdr + comp)
+        if fr[3] != 0x48:
+            raise SystemExit(f"FAIL: CHUNK_SET at offset {off:#x}: {fr.hex()}")
+        n += 1
+    print(f"  ok: blocks 13..1 as pagesets: CHUNK_SET x{n}")
+    for blk in blocks:
+        want = crc32_mpeg2(stock.mpc[blk * BLOCK:(blk + 1) * BLOCK])
+        expect(s.xfer(0x04, struct.pack(">III", MPC_WINDOW | blk * BLOCK, BLOCK, want)), 0x04,
+               f"VERIFY of block {blk}")
+    par_ms = (board.instructions - t_par) * 1000 / board.ips
+    t_seq = board.instructions
+    expect(s.xfer(0x02, struct.pack(">I", MPC_WINDOW)), 0x02, "ERASE of MPC block 0")
+    push_chunks(s, board, MPC_WINDOW, stock.mpc[:BLOCK], "block 0")
+    seq_ms = (board.instructions - t_seq) * 1000 / board.ips
+    print(f"  DME time (pulses instant, wire included): 13 blocks as pagesets {par_ms / 1000:.1f} s "
+          f"= {par_ms / 13 / 1000:.2f} s/block; block 0 sequential {seq_ms / 1000:.2f} s")
 
     if board.cmf.image != stock.mpc:
         first = next(i for i in range(len(stock.mpc))
@@ -167,6 +215,12 @@ def main():
     print("  ok: program marks burned")
 
     # ---- RESET, then the loader must start the stock program ------------
+    sp = bytes(board.m.mu.mem_read(WM_LO, WM_HI - WM_LO))
+    low = next((i for i, b in enumerate(sp) if b != 0xA5), None)
+    depth = STACK_TOP - (WM_LO + low) if low is not None else 0
+    if low is None or low < 0x40:
+        raise SystemExit(f"FAIL: the stack reached within 64 B of the CRC table (depth {depth:#x})")
+    print(f"  ok: stack depth {depth:#x} of the {STACK_TOP - WM_LO:#x} above the CRC table")
     if board.cmf.hv_reads:
         pc, addr = board.cmf.hv_reads[0]
         raise SystemExit(f"FAIL: {len(board.cmf.hv_reads)} CMF array read(s) while EHV was set "

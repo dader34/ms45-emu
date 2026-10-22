@@ -756,7 +756,11 @@ class Board:
                 # the timeout can still fire -- and never past the slice's end,
                 # so the clocks step as they always do
                 k = uc.reg_read(UC_PPC_REG_0 + reg)
-                bound = self.instructions + min(k * per_pass, self._skip_budget)
+                # ... and never ONTO its zero either: the loop's `addic. rk, -1;
+                # bne` exits when the decrement makes zero, so a countdown left
+                # at exactly 0 wraps and spins for 2^32 passes (the silent
+                # SET_BAUD fallback never fired under --fast-wait)
+                bound = self.instructions + min(max(k - 1, 0) * per_pass, self._skip_budget)
                 target = bound if target is None else min(target, bound)
                 if target <= self.instructions:
                     return

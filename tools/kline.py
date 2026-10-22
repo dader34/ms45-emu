@@ -110,7 +110,7 @@ TURBO_LIMIT_SECONDS = 2.0    # ... and to wait for one that has started to finis
 AFTER_RUN_LIMIT_SECONDS = 90 # ignition off: DME time the after-run gets before the main relay drops anyway
 PARKED_SLICES = 4            # ... and how many looks in a row have to find the program parked
 IDLE_TIMEOUT_SECONDS = 3600 # quit after this long without a tester or a command (--idle-timeout)
-BAUD_RATES = (9600, 10400, 19200, 38400, 57600, 115200, 125000)
+BAUD_RATES = (9600, 10400, 19200, 38400, 57600, 115200, 125000, 156250, 208333, 250000, 312500)
 
 
 class Pty:

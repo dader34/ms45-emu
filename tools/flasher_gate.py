@@ -143,7 +143,9 @@ def build(flash, mpc, flasher_entry_cpu=ENTRY_CPU):
         raise ValueError(f"body spans to {body_end:#x}, past the range end {end:#x}")
 
     f, m = bytearray(flash), bytearray(mpc)
-    f[STAMP_AT:STAMP_AT + 16] = stamp_bytes(7, 1)   # v7: MPC writes through the loader's own CMF
+    f[STAMP_AT:STAMP_AT + 16] = stamp_bytes(8, 1)   # v8: pagesets (CHUNK_SET), mask ERASE,
+                                                    #     SET_BAUD, table CRC;
+                                                    # v7: MPC writes through the loader's own CMF
                                                     #     driver (v6's sequence reset the car);
                                                     # v6: each reply byte's echo read as it goes;
                                                     # v5: the CRC loop services the watchdog;

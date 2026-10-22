@@ -7,11 +7,14 @@ Memory plan (the machine is ours from the gate; the loader's and the
 program's SRAM state is dead):
     0x3F9800  this code, then the NRV2B decoder, then the reply buffer
               (reply at code offset 0xC00)
+    0x3FAFF0  BAUD_PROBE -- SET_BAUD's probation countdown (one word)
     0x3FB000  DRV_SDA  -- the CMF driver's r13 data block (0x87C bytes,
               rebuilt before every MPC job; r13 = DRV_R13 while it runs)
+    0x3FB900  CRC_TABLE -- CRC-32/MPEG-2's 256 words, built at entry
     0x3FBFF0  stack top -- non-leaf routines (send_reply, send_bytes, nak,
               rx_telegram) push LR here; the calls nest at most 3 deep,
               a dozen bytes; the CMF driver's frames add a few hundred
+              (0x2F0 is the room above CRC_TABLE)
     0x3FC000  RXBUF    -- telegrams land here (a CHUNK is ~4.6 KB)
     0x3FD800  DSTBUF   -- the decoded 4 KB of a chunk
     0x3FE800  DRV_CODE -- the loader's CMF driver, copied from the boot
@@ -31,15 +34,29 @@ Wire (115200, KWP-shaped telegrams, polled I/O, stop-and-wait):
     the escape: n = 00, then a u16be with the same span. Only the app
     ever needs it (CHUNK); the body accepts both and always replies short.
     Services: HELLO 00, SECTOR_QUERY 01, ERASE 02, CHUNK 03, VERIFY 04,
-    MARKS 05, RESET 06; ACK = svc|0x40, NAK = 7F svc reason (1 perm,
+    MARKS 05, RESET 06, SET_BAUD 07, CHUNK_SET 08; ACK = svc|0x40, NAK =
+    7F svc reason (1 perm,
     2 chunk-crc, 3 decode, 4 readback, 5 verify-mismatch, 6 malformed,
     7 cmf-driver: not found in the boot block, or its erase failed).
     Addresses on the wire are ext offsets; only >= 0x40000 is writable.
     V2: bit 31 of a wire offset selects the MPC window (the CMF, 448 KB
     at CPU 0x0): off = 0x80000000 | mpc_offset. ERASE on the window takes
-    the one 32 KB CMF block containing the offset; CHUNK CMF-programs
-    64-byte pages (a partial tail page is filled from the array itself);
-    QUERY/VERIFY read the array directly. The CMF writes are the boot
+    the one 32 KB CMF block containing the offset -- or, with a u16 block
+    mask after the offset (bit n = block n), all those blocks in ONE
+    erase job (v8); CHUNK CMF-programs 64-byte pages (a partial tail
+    page is filled from the array itself); QUERY/VERIFY read the array
+    directly.
+    V8: CHUNK_SET programs PAGESETS -- the CMF programs one page in each
+    selected block with the same pulses (the driver is NXP's
+    ParallelProgram), so a pageset of up to 14 pages costs what one page
+    did. Header: u16 mask (bit n = block n), u16 offset within the
+    block (64-aligned), u16 declen, u16 clen, u32 crc, u8 pages, 3 pad;
+    the decoded data is `pages` pagesets, each the 64-byte page of every
+    selected block in ascending block order; declen = pages x blocks x
+    64 <= 4096. SET_BAUD (u16 SCBR) answers at the old rate, then
+    switches; unless a telegram arrives within ~2.4 s the body falls
+    back to 115200 by itself (a rate the line cannot carry costs nothing
+    but that wait). The CMF writes are the boot
     loader's own driver (docs/fast-flasher.md, "The MPC (CMF) writes on
     silicon"): a hand-written sequence reset the car, so the body copies
     the loader's position-independent driver out of the protected boot
@@ -68,6 +85,9 @@ from nrv2b_dec import build_decoder                          # noqa: E402
 SRAM_BASE = 0x3F9800
 RXBUF, DSTBUF = 0x3FC000, 0x3FD800
 STACK_TOP = 0x3FBFF0
+CRC_TABLE = 0x3FB900                      # 256 words, built at entry
+BAUD_PROBE = 0x3FAFF0                     # SET_BAUD probation: cmd-loop timeouts left
+BAUD_PROBATION = 120                      # x ~20 ms rx timeout = ~2.4 s to hear a telegram
 ENTRY_AT, BODY_AT = 0xFD400, 0xFD500      # ext offsets; stub at ENTRY copies from BODY_AT
 EXT = 0xFFF00000
 
@@ -93,7 +113,14 @@ DRV_IMAGE_LEN, DRV_CODE_LEN = 0x7C, 0x1778
 DRV_CODE = 0x3FE800                          # SRAM, above DSTBUF
 DRV_SDA, DRV_SDA_LEN = 0x3FB000, 0x87C       # r13-0x7FE8 .. r13-0x776C
 DRV_R13 = DRV_SDA + 0x7FE8
-DRV_ERASE, DRV_PROGRAM = 0x148, 0x21C        # erase_job, program_job
+DRV_ERASE, DRV_PROGRAM = 0x148, 0x21C        # erase_job, program_job (the wrappers)
+# the driver proper (NXP's ParallelProgram state machine): init(r3 = mode,
+# 1 erase / 0 program), start(r3 = block mask, r4 = source, r5 = offset
+# within the block, r6 = shadow flag), step (0x10/0x11 = busy), finish.
+# The mask's bit 31 - n is block n; start latches the source's 64-byte
+# pages into every selected block (ascending) at the same offset, and one
+# pulse sequence programs them all.
+DRV_INIT, DRV_START, DRV_STEP, DRV_FINISH = 0xC60, 0xDF0, 0x1048, 0x1638
 
 SCC1R0, SCC1R1, SC1SR, SC1DR = 0x305008, 0x30500A, 0x30500C, 0x30500E
 SWSR = 0x2FC00E
@@ -116,12 +143,13 @@ MAX_SPAN = 4700                            # chunk worst case + headroom; a long
                                            # two bytes as a u16) -- NAK and resync now
 
 # wire services
-S_HELLO, S_QUERY, S_ERASE, S_CHUNK, S_VERIFY, S_MARKS, S_RESET = range(7)
+S_HELLO, S_QUERY, S_ERASE, S_CHUNK, S_VERIFY, S_MARKS, S_RESET, S_SETBAUD, S_CHUNKSET = range(9)
 # marks (board.VALID_MARKS): ext offset, value, as big-endian halfword pairs
 CAL_MARKS = ((0x5FF80, 0x4824, 0x9042), (0x5FFC0, 0x9048, 0x2442))
 PROG_MARKS = ((0xFFF80, 0x4290, 0x2448), (0xFFFC0, 0x4224, 0x4890))
-REPLY_OFF = 0x1400                         # code+decoder must stay under this (v2:
-                                            # the CMF driver outgrew the old 0xC00)
+REPLY_OFF = 0x1600                         # code+decoder must stay under this (v2:
+                                            # the CMF driver outgrew the old 0xC00;
+                                            # v8 the pageset path outgrew 0x1400)
 
 
 class BodyAsm(GateAsm):
@@ -133,20 +161,24 @@ class BodyAsm(GateAsm):
         self.raw(0x98000000 | (rS << 21) | (rA << 16) | (d & 0xFFFF),
                  f"stb    r{rS}, {d:#x}(r{rA})")
 
-    # X-form register logicals (or/xor/and/nor) are PPC-correct here but
-    # silently broken on this unicorn build -- they never write their
-    # destination (proven word-by-word in a sandbox: `or r9,r3,r3` left
-    # r9 untouched). The body therefore never uses them: register copies
-    # go through addi rD, rS, 0, disjoint-bit merges through add, and
-    # real xor through the self-form immediate xori/xoris pair. These
-    # helpers stay only as documentation of the trap; using one raises.
+    # X-form register logicals: the DESTINATION is the rA field (bits
+    # 11-15, << 16) and the source rS the << 21 field -- the other way
+    # round from every D-form load/store. An earlier build encoded them
+    # swapped and read "unicorn never writes the destination"; unicorn
+    # executes the right encoding correctly (sandboxed 2026-10-21: or, xor,
+    # and, nor all exact). The loader's own driver uses them freely.
+    def _xform(self, xo, rA, rS, rB, name):
+        self.raw(0x7C000000 | (rS << 21) | (rA << 16) | (rB << 11) | (xo << 1),
+                 f"{name:6s} r{rA}, r{rS}, r{rB}")
+
     def xor_(self, rA, rS, rB):
-        raise NotImplementedError("X-form xor is a no-op on this unicorn build "
-                                  "-- see the comment above")
+        self._xform(316, rA, rS, rB, "xor")
 
     def or_(self, rA, rS, rB):
-        raise NotImplementedError("X-form or is a no-op on this unicorn build "
-                                  "-- see the comment above")
+        self._xform(444, rA, rS, rB, "or")
+
+    def and_(self, rA, rS, rB):
+        self._xform(28, rA, rS, rB, "and")
 
     def xori(self, rA, imm):                # self-form only: rA ^= imm16
         self.raw(0x68000000 | (rA << 21) | (rA << 16) | (imm & 0xFFFF),
@@ -480,41 +512,57 @@ def _rx_telegram(a):
     a.ret()                                 # byte -- no NAK for silence
 
 
+def _crc_table(a):
+    """Build CRC-32/MPEG-2's table at CRC_TABLE (sram_entry; ~16k insns)."""
+    a.li32(3, CRC_TABLE)
+    a.li(4, 0)
+    a.label("ct_entry")
+    a.rlwinm(5, 4, 24, 0, 7)                # i << 24
+    a.li(6, 8)
+    a.label("ct_bit")
+    a.rlwinm(7, 5, 1, 31, 31)               # the top bit
+    a.rlwinm(5, 5, 1, 0, 30)                # << 1
+    a.cmplwi(7, 0)
+    a.beq("ct_keep")
+    a.xoris(5, 0x04C1)                      # ^= 0x04C11DB7
+    a.xori(5, 0x1DB7)
+    a.label("ct_keep")
+    a.addic_(6, -1)
+    a.bne("ct_bit")
+    a.stw(5, 0, 3)
+    a.addi(3, 3, 4)
+    a.addi(4, 4, 1)
+    a.cmplwi(4, 256)
+    a.blt("ct_entry")
+
+
 def _crc32(a):
     """r3 = ptr, r4 = len -> r3 = CRC-32/MPEG-2 (poly 0x04C11DB7, init all-ones).
 
-    Msb-first bit feed, so the only xor is with the constant polynomial --
-    the self-form xoris/xori pair unicorn executes correctly. A byte-wise
-    xor with the wrapped crc top would need the register xor it lacks.
+    Table-driven, ~12 instructions a byte (the bitwise v4-v7 loop was ~110:
+    a 64 KB QUERY took 600 ms on the car; now ~60 ms). The watchdog is
+    serviced every 256 bytes (~80 us) against the loader's 100 ms period.
     """
     a.label("crc32")
     a.li32(5, 0xFFFFFFFF)
+    a.li32(11, CRC_TABLE)
     a.label("c3_byte")
     a.cmplwi(4, 0)
     a.beq("c3_done")
-    # ~110 instructions a byte: a 128 KB QUERY is ~0.4 s and a 256 KB VERIFY
-    # twice that, against the loader's 100 ms watchdog -- v4 serviced it
-    # nowhere in here and the car reset mid-QUERY. Once a byte is cheap.
+    a.andi_(12, 4, 0xFF)
+    a.bne("c3_go")
     _swsr(a)
+    a.label("c3_go")
     a.lbz(7, 0, 3)
     a.addi(3, 3, 1)
     a.addi(4, 4, -1)
-    a.li(9, 8)
-    a.label("c3_bit")
-    a.rlwinm(6, 5, 1, 31, 31)               # crc's top bit
-    a.rlwinm(8, 5, 1, 0, 30)                # crc << 1
-    a.rlwinm(10, 7, 25, 31, 31)             # the byte's top bit
-    a.add(6, 6, 10)                         # top + bit: 0, 1 or 2
-    a.rlwinm(6, 6, 0, 31, 31)               # bit 0 = feedback (top ^ bit)
-    a.cmplwi(6, 0)
-    a.beq("c3_keep")
-    a.xoris(8, 0x04C1)                      # crc' ^= 0x04C11DB7
-    a.xori(8, 0x1DB7)
-    a.label("c3_keep")
-    a.mr(5, 8)
-    a.rlwinm(7, 7, 1, 24, 31)               # byte <<= 1 (eight bits)
-    a.addic_(9, -1)
-    a.bne("c3_bit")
+    a.rlwinm(8, 5, 8, 24, 31)               # crc >> 24
+    a.xor_(8, 8, 7)                         # the table index
+    a.rlwinm(8, 8, 2, 22, 29)               # x4
+    a.add(8, 8, 11)
+    a.lwz(9, 0, 8)
+    a.rlwinm(5, 5, 8, 0, 23)                # crc << 8
+    a.xor_(5, 5, 9)
     a.b("c3_byte")
     a.label("c3_done")
     a.mr(3, 5)
@@ -636,6 +684,20 @@ def _epee_on(a):
     a.blr()
 
 
+def _drv_call(a, entry):
+    """Call the driver at DRV_CODE + entry (r3.. are its arguments, r7 is
+    scratch). The driver's compiled routines save their LR in the CALLER's
+    frame, at r1+4 (EABI) -- which in the body's push_lr scheme is the
+    enclosing routine's pushed LR, so a 16-byte gap is opened for it.
+    (v7 got away without one: its callers sat one level up, where r1+4
+    was the unused word above the stack top.)"""
+    a.addi(1, 1, -16)
+    a.li32(7, DRV_CODE + entry)
+    a.mtctr(7)
+    a.bctrl()
+    a.addi(1, 1, 16)
+
+
 def _copyw(a):
     """r3 = src, r4 = dst, r5 = word count (> 0); leaf, clobbers r3-r6."""
     a.label("copyw")
@@ -707,32 +769,147 @@ def _cmf_setup(a):
     a.ret()
 
 
+def _blocks_mask(a):
+    """r3 = wire block mask (bit n = block n, 14 bits) -> r3 = the driver's
+    (bit 31 - n = block n). Leaf, clobbers r3-r7."""
+    a.label("blocks_mask")
+    a.li(4, 0)
+    a.li32(5, 0x80000000)
+    a.li(6, 14)
+    a.label("bm_loop")
+    a.andi_(7, 3, 1)
+    a.beq("bm_next")
+    a.add(4, 4, 5)                          # disjoint bits
+    a.label("bm_next")
+    a.rlwinm(3, 3, 31, 1, 31)               # >> 1
+    a.rlwinm(5, 5, 31, 1, 31)
+    a.addic_(6, -1)
+    a.bne("bm_loop")
+    a.mr(3, 4)
+    a.blr()
+
+
 def _cmf_erase(a):
     """r3 = MPC address: erase the one 32 KB block holding it with the
     loader's erase_job. r3 = 0 done, 7 driver missing or refused."""
     a.label("cmf_erase")
     a.push_lr()
-    a.mr(24, 3)
-    a.bl("cmf_setup")
-    a.cmplwi(3, 0)
-    a.bne("ce_out")
-    a.rlwinm(24, 24, 17, 17, 31)           # >> 15: the block index, 0-13
+    a.rlwinm(3, 3, 17, 17, 31)             # >> 15: the block index, 0-13
     a.li32(4, 0x80000000)                  # block n's mask bit is 31 - n
     a.label("ce_shift")
-    a.cmplwi(24, 0)
+    a.cmplwi(3, 0)
     a.beq("ce_go")
     a.rlwinm(4, 4, 31, 1, 31)              # >> 1
-    a.addic_(24, -1)
+    a.addic_(3, -1)
     a.b("ce_shift")
     a.label("ce_go")
     a.mr(3, 4)
-    a.li32(5, DRV_CODE + DRV_ERASE)
-    a.mtctr(5)
-    a.bctrl()
+    a.bl("cmf_erase_mask")
+    a.ret()
+
+
+def _cmf_erase_mask(a):
+    """r3 = the driver's block mask: erase all those blocks in one job (the
+    CMF erases every selected block with the same pulses, so fourteen cost
+    what one does). r3 = 0 done, 7 driver missing or refused."""
+    a.label("cmf_erase_mask")
+    a.push_lr()
+    a.mr(24, 3)
+    a.bl("cmf_setup")
     a.cmplwi(3, 0)
-    a.beq("ce_out")
+    a.bne("cem_out")
+    a.mr(3, 24)
+    _drv_call(a, DRV_ERASE)
+    a.cmplwi(3, 0)
+    a.beq("cem_out")
     a.li(3, 7)
-    a.label("ce_out")
+    a.label("cem_out")
+    a.ret()
+
+
+def _cmf_chunkset(a):
+    """r3 = the driver's block mask, r4 = offset within the block, r5 =
+    pagesets, r6 = source (SRAM: each pageset is the 64-byte page of every
+    selected block, ascending). Drives the driver proper: init, then per
+    pageset start / step until done / read every page back, then finish --
+    what program_job does for one block, over up to fourteen at once.
+    r3 = 0 done, 4 a page would not take (or the driver refused), 7
+    driver missing."""
+    a.label("cmf_chunkset")
+    a.push_lr()
+    a.mr(24, 3)
+    a.mr(25, 4)
+    a.mr(26, 5)
+    a.mr(27, 6)
+    a.bl("cmf_setup")
+    a.cmplwi(3, 0)
+    a.bne("cs_out")
+    a.li(3, 0)                              # init(program)
+    _drv_call(a, DRV_INIT)
+    _swsr(a)
+    a.cmplwi(3, 0)
+    a.bne("cs_fail")
+    a.label("cs_pageset")
+    a.mr(3, 24)
+    a.mr(4, 27)
+    a.mr(5, 25)
+    a.li(6, 0)
+    _drv_call(a, DRV_START)
+    _swsr(a)
+    a.cmplwi(3, 0)
+    a.bne("cs_fail")
+    a.label("cs_step")
+    _drv_call(a, DRV_STEP)
+    _swsr(a)
+    a.cmplwi(3, 0x10)
+    a.beq("cs_step")
+    a.cmplwi(3, 0x11)
+    a.beq("cs_step")
+    a.cmplwi(3, 0)
+    a.bne("cs_fail")
+    # read every page of the pageset back, blocks ascending (the source
+    # cursor r27 walks the pageset as the driver's copy did)
+    a.mr(8, 24)
+    a.li(9, 0)                              # block n's array base
+    a.li32(10, 0x8000)
+    a.label("cs_rb")
+    a.rlwinm(11, 8, 1, 31, 31)              # the mask's top bit: this block?
+    a.cmplwi(11, 0)
+    a.beq("cs_rb_next")
+    a.add(3, 9, 25)
+    a.li(4, 64)
+    a.label("cs_cmp")
+    a.lbz(5, 0, 3)
+    a.lbz(6, 0, 27)
+    a.subf(5, 6, 5)                         # zero iff equal
+    a.cmplwi(5, 0)
+    a.bne("cs_fail")
+    a.addi(3, 3, 1)
+    a.addi(27, 27, 1)
+    a.addic_(4, -1)
+    a.bne("cs_cmp")
+    a.label("cs_rb_next")
+    a.add(9, 9, 10)
+    a.rlwinm(8, 8, 1, 0, 30)                # << 1
+    a.cmplwi(8, 0)
+    a.bne("cs_rb")
+    a.addi(25, 25, 64)
+    a.addic_(26, -1)
+    a.bne("cs_pageset")
+    _drv_call(a, DRV_FINISH)
+    _swsr(a)
+    a.cmplwi(3, 0)
+    a.beq("cs_ok")
+    a.li(3, 4)
+    a.b("cs_out")
+    a.label("cs_fail")                      # close the sequence as the wrapper does
+    _drv_call(a, DRV_FINISH)
+    _swsr(a)
+    a.li(3, 4)
+    a.b("cs_out")
+    a.label("cs_ok")
+    a.li(3, 0)
+    a.label("cs_out")
     a.ret()
 
 
@@ -752,9 +929,7 @@ def _cmf_program(a):
     a.mr(3, 25)
     a.mr(4, 24)
     a.mr(5, 26)
-    a.li32(6, DRV_CODE + DRV_PROGRAM)
-    a.mtctr(6)
-    a.bctrl()
+    _drv_call(a, DRV_PROGRAM)
     a.label("cp_out")
     a.ret()
 
@@ -822,6 +997,10 @@ def build_body():
     # tester's 8E1 receiver read every reply garbled on the car
     a.li(4, PE | M | TE | RE)               # polled, no interrupts
     a.sth(4, 0, 3)
+    _crc_table(a)
+    a.li32(5, BAUD_PROBE)
+    a.li(6, 0)
+    a.stw(6, 0, 5)
     _hello_payload(a)
     a.li(3, 16)
     a.li(4, S_HELLO | 0x40)
@@ -831,7 +1010,23 @@ def build_body():
     a.label("cmd")
     a.bl("rx_telegram")
     a.cmplwi(3, 0)
-    a.beq("cmd")                            # malformed: already NAKed
+    a.bne("cmd_ok")
+    # nothing (or garbage): after a SET_BAUD this counts down the probation,
+    # and at zero the body goes back to 115200 on its own
+    a.li32(5, BAUD_PROBE)
+    a.lwz(6, 0, 5)
+    a.cmplwi(6, 0)
+    a.beq("cmd")
+    a.addic_(6, -1)
+    a.stw(6, 0, 5)
+    a.bne("cmd")
+    a.li(3, SCBR_115200)
+    a.sth(3, 0, 30)
+    a.b("cmd")
+    a.label("cmd_ok")
+    a.li32(5, BAUD_PROBE)                   # a telegram at this rate: it holds
+    a.li(6, 0)
+    a.stw(6, 0, 5)
     a.li32(3, RXBUF)
     a.lbz(3, 3, 3)                          # the service byte
     a.cmplwi(3, S_HELLO)
@@ -848,6 +1043,10 @@ def build_body():
     a.beq("op_marks")
     a.cmplwi(3, S_RESET)
     a.beq("op_reset")
+    a.cmplwi(3, S_SETBAUD)
+    a.beq("op_setbaud")
+    a.cmplwi(3, S_CHUNKSET)
+    a.beq("op_chunkset")
     _nak_r(a, 6, "cmd")                     # unknown service
 
     a.label("op_hello")
@@ -899,9 +1098,23 @@ def build_body():
     a.bl("send_reply")
     a.b("cmd")
     a.label("e_mpc")
+    a.li32(3, RXBUF)
+    a.lbz(5, 0, 3)                          # the span: 8 plain, 10 with a block mask
+    a.cmplwi(5, 10)
+    a.beq("e_mask")
     a.mr(3, 24)
     a.bl("base")                            # the array address of the block
     a.bl("cmf_erase")
+    a.b("e_done")
+    a.label("e_mask")
+    a.lhz(3, 8, 3)                          # bit n = block n
+    a.cmplwi(3, 0)
+    a.beq("e_mal")
+    a.andi_(5, 3, 0xC000)                   # fourteen blocks
+    a.bne("e_mal")
+    a.bl("blocks_mask")
+    a.bl("cmf_erase_mask")
+    a.label("e_done")
     a.cmplwi(3, 0)
     a.bne("e_drv")
     a.li(3, 0)
@@ -912,6 +1125,8 @@ def build_body():
     _nak_r(a, 1, "cmd")
     a.label("e_drv")
     _nak_r(a, 7, "cmd")
+    a.label("e_mal")
+    _nak_r(a, 6, "cmd")
 
     # ---- CHUNK: hdr at RXBUF+4, compressed bytes at RXBUF+16 -----------
     a.label("op_chunk")
@@ -1007,6 +1222,110 @@ def build_body():
     a.label("ck_drv")
     _nak_r(a, 7, "cmd")
 
+    # ---- SET_BAUD: ACK at the old rate, then switch, on probation --------
+    a.label("op_setbaud")
+    a.li32(3, RXBUF)
+    a.lhz(24, 4, 3)                         # SCBR: 40 MHz / (32 x SCBR)
+    a.cmplwi(24, 0)
+    a.beq("sb_mal")
+    a.cmplwi(24, 0x1FFF)
+    a.bgt("sb_mal")
+    a.li(3, 0)
+    a.li(4, S_SETBAUD | 0x40)
+    a.bl("send_reply")                      # its last echo read: the line is quiet
+    a.sth(24, 0, 30)
+    a.li32(5, BAUD_PROBE)
+    a.li(6, BAUD_PROBATION)
+    a.stw(6, 0, 5)
+    a.b("cmd")
+    a.label("sb_mal")
+    _nak_r(a, 6, "cmd")
+
+    # ---- CHUNK_SET: pagesets over several MPC blocks at once -----------
+    # hdr at RXBUF+4: mask u16, offset u16, declen u16, clen u16, crc u32,
+    # pages u8, 3 pad; packed bytes at RXBUF+20
+    a.label("op_chunkset")
+    a.li32(3, RXBUF)
+    a.lhz(24, 4, 3)                         # block mask, bit n = block n
+    a.lhz(25, 6, 3)                         # offset within the block
+    a.lhz(26, 8, 3)                         # declen
+    a.lhz(27, 10, 3)                        # clen
+    a.lwz(20, 12, 3)                        # crc of the packed bytes
+    a.lbz(21, 16, 3)                        # pagesets
+    a.cmplwi(24, 0)
+    a.beq("cs_mal")
+    a.andi_(5, 24, 0xC000)
+    a.bne("cs_mal")
+    a.andi_(5, 25, 0x3F)                    # 64-aligned
+    a.bne("cs_mal")
+    a.cmplwi(21, 0)
+    a.beq("cs_mal")
+    a.cmplwi(21, 64)
+    a.bgt("cs_mal")
+    a.rlwinm(5, 21, 6, 0, 25)               # pages x 64
+    a.add(5, 5, 25)
+    a.li32(6, 0x8000)
+    a.cmplw(5, 6)                           # stays inside the block
+    a.bgt("cs_mal")
+    a.mr(5, 24)                             # blocks = popcount(mask)
+    a.li(6, 0)
+    a.label("cs_pop")
+    a.andi_(7, 5, 1)
+    a.beq("cs_pop_next")
+    a.addi(6, 6, 1)
+    a.label("cs_pop_next")
+    a.rlwinm(5, 5, 31, 1, 31)
+    a.cmplwi(5, 0)
+    a.bne("cs_pop")
+    a.rlwinm(7, 6, 6, 0, 25)                # blocks x 64
+    a.li(8, 0)                              # x pages
+    a.mr(9, 21)
+    a.label("cs_mul")
+    a.add(8, 8, 7)
+    a.addic_(9, -1)
+    a.bne("cs_mul")
+    a.cmplw(8, 26)                          # declen = pages x blocks x 64
+    a.bne("cs_mal")
+    a.cmplwi(26, 4096)
+    a.bgt("cs_mal")
+    a.cmplwi(27, 4616)
+    a.bgt("cs_mal")
+    a.li32(3, RXBUF + 20)
+    a.mr(4, 27)
+    a.bl("crc32")
+    a.cmplw(3, 20)
+    a.bne("cs_crc")
+    a.li32(3, RXBUF + 20)                   # decode (clobbers r3-r12, r14)
+    a.li32(4, DSTBUF)
+    a.mr(5, 26)
+    a.bl("dec")
+    a.cmplwi(3, 0)
+    a.beq("cs_dec")
+    a.mr(3, 24)
+    a.bl("blocks_mask")
+    a.mr(4, 25)
+    a.mr(5, 21)
+    a.li32(6, DSTBUF)
+    a.bl("cmf_chunkset")
+    a.cmplwi(3, 7)
+    a.beq("cs_drv")
+    a.cmplwi(3, 0)
+    a.bne("cs_rb")
+    a.li(3, 0)
+    a.li(4, S_CHUNKSET | 0x40)
+    a.bl("send_reply")
+    a.b("cmd")
+    a.label("cs_mal")
+    _nak_r(a, 6, "cmd")
+    a.label("cs_crc")
+    _nak_r(a, 2, "cmd")
+    a.label("cs_dec")
+    _nak_r(a, 3, "cmd")
+    a.label("cs_drv")
+    _nak_r(a, 7, "cmd")
+    a.label("cs_rb")
+    _nak_r(a, 4, "cmd")
+
     # ---- VERIFY: crc32 of an ext range against a value ------------------
     a.label("op_verify")
     a.li32(3, RXBUF)
@@ -1087,7 +1406,10 @@ def build_body():
     _epee_on(a)
     _copyw(a)
     _cmf_setup(a)
+    _blocks_mask(a)
     _cmf_erase(a)
+    _cmf_erase_mask(a)
+    _cmf_chunkset(a)
     _cmf_program(a)
 
     # ---- the NRV2B decoder blob -----------------------------------------
@@ -1140,5 +1462,6 @@ if __name__ == "__main__":
     print(f"body: {len(body)} words ({size:#x} bytes) at ext {BODY_AT:#x} "
           f"(spans to {BODY_AT + size:#x}, budget {0xFFF40:#x})")
     print(f"reply buffer at SRAM {SRAM_BASE + REPLY_OFF:#x}; rx {RXBUF:#x}; dst {DSTBUF:#x}")
+    print(f"CRC table at {CRC_TABLE:#x}; baud probation word at {BAUD_PROBE:#x}")
     print(f"CMF driver: code at {DRV_CODE:#x}-{DRV_CODE + DRV_CODE_LEN:#x}, "
           f"data {DRV_SDA:#x}-{DRV_SDA + DRV_SDA_LEN:#x} (r13 = {DRV_R13:#x})")
