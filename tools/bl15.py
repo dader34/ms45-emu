@@ -96,13 +96,41 @@ def build_parkwin(stub_cpu):
     return a.words
 
 
+def ring(installer=False):
+    """{ext offset: bytes} of the ring: windows, stamp, stub and body."""
+    was = flasher_body.STAMP_SRC, flasher_body.PERM_LOW
+    flasher_body.STAMP_SRC = STAMP_AT
+    if installer:
+        flasher_body.PERM_LOW = 0x4000
+    try:
+        body_words, _notes = build_body()
+    finally:
+        flasher_body.STAMP_SRC, flasher_body.PERM_LOW = was
+    end = BODY_AT + 4 * len(body_words)
+    if end > SPAN_END:
+        raise ValueError(f"body spans to {end:#x}, past the span end {SPAN_END:#x}")
+    return {WINDOW_AT: pack(bl14.build_window(CPU + STUB_AT)),
+            PARKWIN_AT: pack(build_parkwin(CPU + STUB_AT)),
+            STAMP_AT: stamp_bytes(flags=7 if installer else 3),
+            STUB_AT: pack(bl14.build_stub(len(body_words), BODY_AT)),
+            BODY_AT: pack(body_words)}
+
+
 def stamp_bytes(version=VERSION, flags=3):
     return (b"MS45BL" + bytes([version, flags])
             + struct.pack(">II", CPU + WINDOW_AT, CPU + STUB_AT))
 
 
-def build(flash, mpc):
-    """The stock pair -> the same pair carrying the BL15 ring. MPC unchanged."""
+def build(flash, mpc, installer=False):
+    """The stock pair -> the same pair carrying the BL15 ring. MPC unchanged.
+
+    installer=True builds the ring's INSTALLER variant: the same windows,
+    stub and layout, but the body's write window opened down to 0x4000
+    (flasher_body.PERM_LOW) and the stamp's flags bit 2 set. It is the only
+    flasher a held line can reach on a BL15 DME that may rewrite the 8 KB
+    sector holding the two patched words -- the way back to the stock
+    loader (BMWeb's Restore stock bootloader). Either variant may stand
+    where the other is: the ring check accepts both."""
     callsite = struct.unpack_from(">II", flash, PARK_CALL_AT)
     if callsite != PARK_CALL:
         raise ValueError(f"ext {PARK_CALL_AT:#x} holds {callsite[0]:#010x},{callsite[1]:#010x}: "
@@ -114,26 +142,17 @@ def build(flash, mpc):
     if handoff not in (bl14.STOCK_PATCH_WORD, hook_word(CPU + WINDOW_AT)):
         raise ValueError(f"ext {bl14.PATCH_AT:#x} holds {handoff:#010x}, not the stock handoff")
 
-    was = flasher_body.STAMP_SRC
-    flasher_body.STAMP_SRC = STAMP_AT
-    try:
-        body_words, _notes = build_body()
-    finally:
-        flasher_body.STAMP_SRC = was
-    stub = bl14.build_stub(len(body_words), BODY_AT)
-    window = bl14.build_window(CPU + STUB_AT)
-    parkwin = build_parkwin(CPU + STUB_AT)
-    end = BODY_AT + 4 * len(body_words)
-    if end > SPAN_END:
-        raise ValueError(f"body spans to {end:#x}, past the span end {SPAN_END:#x}")
+    def laid(r):
+        span = bytearray(b"\xff" * (SPAN_END - WINDOW_AT))
+        for at, blob in r.items():
+            span[at - WINDOW_AT:at - WINDOW_AT + len(blob)] = blob
+        return bytes(span)
+    mine = laid(ring(installer))
+    have = bytes(flash[WINDOW_AT:SPAN_END])
+    if have not in (b"\xff" * len(have), mine, laid(ring(not installer))):
+        raise ValueError(f"ext {WINDOW_AT:#x}-{SPAN_END:#x}: neither blank nor our own ring")
     f = bytearray(flash)
-    for at, blob in ((WINDOW_AT, pack(window)), (PARKWIN_AT, pack(parkwin)),
-                     (STAMP_AT, stamp_bytes()), (STUB_AT, pack(stub)),
-                     (BODY_AT, pack(body_words))):
-        have = bytes(f[at:at + len(blob)])
-        if have not in (b"\xff" * len(blob), blob):  # blank, or ours already
-            raise ValueError(f"ext {at:#x}: neither blank nor our own ring")
-        f[at:at + len(blob)] = blob
+    f[WINDOW_AT:SPAN_END] = mine
     struct.pack_into(">I", f, bl14.PATCH_AT, hook_word(CPU + WINDOW_AT))
     struct.pack_into(">I", f, PARK_HOOK_AT, hook_word(CPU + PARKWIN_AT))
     return f, mpc
