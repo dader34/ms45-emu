@@ -97,6 +97,35 @@ class Session:
         f = bytes(t[mark:mark + n + 1])
         return f if sum(f[1:n]) & 0xFF == f[n] else "badck"
 
+    def read(self, off, n, budget=200_000_000):  # 4 KB at ~20k cycles a byte
+        """v13 READ: the long reply's crc and data, checked against each other."""
+        mark = len(self.sci.tx)
+        self.sci.send(frame(10, struct.pack(">IH", off, n)))
+
+        def whole():
+            t = self.sci.tx
+            if len(t) < mark + 3:
+                return None
+            if t[mark] != 0:                     # a short frame: a NAK
+                return self.reply_at(mark)
+            span = (t[mark + 1] << 8) | t[mark + 2]
+            if len(t) < mark + 3 + span:
+                return None
+            return bytes(t[mark:mark + 3 + span])
+        if not self.until(lambda: whole() is not None, budget):
+            raise SystemExit(f"FAIL: no READ reply at {off:#x} (pc={self.b.m.pc:#x}, sent {len(self.sci.tx) - mark}: {bytes(self.sci.tx[mark:mark + 24]).hex()})")
+        f = whole()
+        if f[0] != 0:
+            raise SystemExit(f"FAIL: READ {off:#x}+{n}: {f.hex()}")
+        if sum(f[3:-1]) & 0xFF != f[-1]:
+            raise SystemExit(f"FAIL: READ {off:#x}: bad frame checksum")
+        if f[5] != 0x4A:
+            raise SystemExit(f"FAIL: READ {off:#x}: reply svc {f[5]:#x}")
+        crc, data = struct.unpack(">I", f[6:10])[0], f[10:-1]
+        if len(data) != n or crc32_mpeg2(data) != crc:
+            raise SystemExit(f"FAIL: READ {off:#x}: {len(data)} bytes, crc mismatch")
+        return data
+
     def xfer(self, svc, payload=b"", budget=60_000_000):
         mark = len(self.sci.tx)
         self.sci.send(frame(svc, payload))
@@ -147,15 +176,27 @@ def main():
     if not s.until(lambda: len(sci.tx) >= 21):
         raise SystemExit("FAIL: no HELLO after the break released")
     hello = bytes(sci.tx[:21])
-    if hello != frame(0x40, stamp_bytes(9, 1)):
+    if hello != frame(0x40, stamp_bytes(13, 3)):
         raise SystemExit(f"FAIL: HELLO mismatch: {hello.hex()} "
-                         f"(want {frame(0x40, stamp_bytes(9, 1)).hex()})")
+                         f"(want {frame(0x40, stamp_bytes(13, 3)).hex()})")
     print(f"hello: {hello[4:10].decode()} v{hello[10]} flags {hello[11]:#04x}")
     board.watchdog_window()                      # the body runs from here
     board.sci.model_overrun = True               # the real SCI drops, it does not wait
 
     expect(s.xfer(0x00), 0x00, "HELLO (request form)")
     expect_nak(s.xfer(0x77), 0x77, 6, "unknown service")
+
+    # v13 READ: anywhere on the chip (the boot block too) and the MPC
+    img, mpc = bytes(board.flash.image), bytes(m)
+    for off, n, want in ((0x40000, 4096, img[0x40000:0x41000]),
+                         (0x7F00, 512, img[0x7F00:0x8100]),
+                         (0xFFFF0, 16, img[0xFFFF0:0x100000]),
+                         (0x80000000 | 0x6F000, 4096, mpc[0x6F000:0x70000])):
+        if s.read(off, n) != want:
+            raise SystemExit(f"FAIL: READ {off:#x}+{n} differs from the image")
+    print("  ok: READ ext (cal, across 0x8000, the chip's last bytes) and the MPC")
+    expect_nak(s.xfer(10, struct.pack(">IH", 0xFFFF0, 32)), 10, 1, "READ past the chip refused")
+    expect_nak(s.xfer(10, struct.pack(">IH", 0x40000, 4097)), 10, 6, "READ over 4096 bytes refused")
 
     mark = len(sci.tx)                           # a corrupted checksum
     bad = bytearray(frame(0x00))

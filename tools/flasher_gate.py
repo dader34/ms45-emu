@@ -142,8 +142,23 @@ def build(flash, mpc, flasher_entry_cpu=ENTRY_CPU):
     if body_end > end:
         raise ValueError(f"body spans to {body_end:#x}, past the range end {end:#x}")
 
+    import flasher_body                              # PARK_PC is filled only now (build_parts ran)
+    # v10, flags bit 1: the AIF-wipe boot-sector window + resume-marker
+    # service, built ONLY when flasher_body.ALLOW_BOOT_SECTOR is set (a
+    # bench build). A shipped body leaves the flag clear and stays v9,
+    # byte-identical -- the window and the S_AIF service are not compiled.
     f, m = bytearray(flash), bytearray(mpc)
-    f[STAMP_AT:STAMP_AT + 16] = stamp_bytes(9, 1)   # v9: SET_BAUD holds only once confirmed;
+    boot = bool(flasher_body.ALLOW_BOOT_SECTOR)
+    version = 13 if boot else 9                     # v13: READ (raw bytes, 4 KB a request);
+                                                    # v12: the AIF wipe in every body, its
+                                                    # window shut until a slot is armed;
+                                                    # v11: marker slots (v10 wiped once)
+    flags = 1 | (2 if boot else 0)                  # bit 0 = v2 MPC window
+    if boot and flasher_body.PERM_LOW < 0x8000:     # bit 2 = the BL14 installer
+        flags |= 4                                  # variant: the window opens at
+                                                    # PERM_LOW (the 8 KB sector 0x4000)
+    f[STAMP_AT:STAMP_AT + 16] = stamp_bytes(version, flags)
+                                                    # v9: SET_BAUD holds only once confirmed;
                                                     # v8: pagesets (CHUNK_SET), mask ERASE,
                                                     #     SET_BAUD, table CRC;
                                                     # v7: MPC writes through the loader's own CMF
@@ -152,9 +167,7 @@ def build(flash, mpc, flasher_entry_cpu=ENTRY_CPU):
                                                     # v5: the CRC loop services the watchdog;
                                                     # v4: the SCI sends 8E1 (v3 sent 8N1);
                                                     # v3: real-cable hardening (reply
-                                                    # gap, rx timeout, header-before-span);
-                                                    # flags bit 0 = the v2 MPC window
-    import flasher_body                              # PARK_PC is filled only now (build_parts ran)
+                                                    # gap, rx timeout, header-before-span)
     struct.pack_into(">I", f, PARK_MARK_AT, flasher_body.PARK_PC)
     f[GATE_AT:GATE_AT + 4 * len(build_gate(flasher_entry_cpu))] = pack(build_gate(flasher_entry_cpu))
     f[ENTRY_AT:ENTRY_AT + 4 * len(stub)] = pack(stub)

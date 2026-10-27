@@ -6,7 +6,7 @@ relocate stub at 0xFD400 before the first flash op.
 Memory plan (the machine is ours from the gate; the loader's and the
 program's SRAM state is dead):
     0x3F9800  this code, then the NRV2B decoder, then the reply buffer
-              (reply at code offset 0xC00)
+              (reply at code offset REPLY_OFF, 0x1780: 112 bytes to BAUD_PROBE)
     0x3FAFF0  BAUD_PROBE -- SET_BAUD's probation countdown (one word)
     0x3FB000  DRV_SDA  -- the CMF driver's r13 data block (0x87C bytes,
               rebuilt before every MPC job; r13 = DRV_R13 while it runs)
@@ -93,7 +93,26 @@ CRC_TABLE = 0x3FB900                      # 256 words, built at entry
 BAUD_PROBE = 0x3FAFF0                     # SET_BAUD probation: cmd-loop timeouts left
 BAUD_PROBATION = 120                      # cmd-loop turns (x ~20 ms when silent) to be confirmed
 ENTRY_AT, BODY_AT = 0xFD400, 0xFD500      # ext offsets; stub at ENTRY copies from BODY_AT
+# Where _hello_payload reads the 16-byte HELLO stamp from. The gate layout
+# keeps it at flasher_gate's STAMP_AT (next to the gate, in the program
+# area); BL14's ring points it at the ring's own stamp in the boot sector
+# (tools/bl14.py sets it for its body build), so the announcement is the
+# loader's identity and survives any program reflash.
+STAMP_SRC = STAMP_AT
 EXT = 0xFFF00000
+
+# Emulator-only: when True, _perm also admits the 96 KB boot sector
+# [0x8000, 0x20000) so the AIF-wipe experiment can erase it and stream the
+# boot content back. Never set on a body built for the car -- the shipped
+# gate/body builders leave it False. (tools/aif_wipe_flasher.py flips it.)
+ALLOW_BOOT_SECTOR = True
+
+# The lower edge of that opened window. The shipped body keeps the stock
+# 0x8000 (the 96 KB boot sector); the BL14 installer variant lowers it to
+# 0x4000 (tools/bl14_test.py) so the one patched handoff word at ext 0x4EBC,
+# which lives in the 8 KB sector below, can be erased and rewritten too.
+# Everything below PERM_LOW stays refused, as before.
+PERM_LOW = 0x8000
 
 # the MPC window: wire offsets with bit 31 set address the CMF (448 KB at
 # CPU 0x0), in 32 KB blocks; the EPEE pin is the MIOS parallel port bit 0x40
@@ -147,13 +166,36 @@ MAX_SPAN = 4700                            # chunk worst case + headroom; a long
                                            # two bytes as a u16) -- NAK and resync now
 
 # wire services
-S_HELLO, S_QUERY, S_ERASE, S_CHUNK, S_VERIFY, S_MARKS, S_RESET, S_SETBAUD, S_CHUNKSET = range(9)
+(S_HELLO, S_QUERY, S_ERASE, S_CHUNK, S_VERIFY, S_MARKS, S_RESET, S_SETBAUD,
+ S_CHUNKSET, S_AIF, S_READ) = range(11)
+READ_MAX = 4096                             # v13 READ: bytes per request
+
+# AIF-wipe resume marker (only built when ALLOW_BOOT_SECTOR). It records the
+# boot-sector wipe's phase in the loader's blank tail at ext 0x387EC, which
+# survives the boot-sector erase (a different sector) and whose bit-clearing
+# transitions program without an erase: 0xFFFF -> 0xA55A (armed) -> 0xA558
+# (done). Arm-before-erase is enforced in op_erase, so an interrupted session
+# always leaves a marker the host can read on reconnect and converge from.
+# Same address and values as aif_wipe.py's reset-payload marker.
+MARK_AT = 0x387EC
+MARK_ARMED, MARK_DONE = 0xA55A, 0xA558
+# v11: a row of marker slots from MARK_AT (the tail is blank to 0x40000). A
+# slot reading MARK_DONE is spent; the current slot is the first that is not,
+# so every wipe gets a fresh one (v10 had the one halfword: after its first
+# wipe it read DONE for good and refused every boot-sector erase after).
+MARK_SLOTS = 64
+# AIF service subcommands (payload byte at RXBUF+4).
+AIF_READ, AIF_ARM, AIF_DONE = 0, 1, 2
+BOOT_SECTOR, BOOT_SECTOR_END = 0x8000, 0x20000
 # marks (board.VALID_MARKS): ext offset, value, as big-endian halfword pairs
 CAL_MARKS = ((0x5FF80, 0x4824, 0x9042), (0x5FFC0, 0x9048, 0x2442))
 PROG_MARKS = ((0xFFF80, 0x4290, 0x2448), (0xFFFC0, 0x4224, 0x4890))
-REPLY_OFF = 0x1600                         # code+decoder must stay under this (v2:
+REPLY_OFF = 0x1780                         # code+decoder must stay under this (v2:
                                             # the CMF driver outgrew the old 0xC00;
-                                            # v8 the pageset path outgrew 0x1400)
+                                            # v8 the pageset path outgrew 0x1400;
+                                            # v12 the AIF wipe + READ outgrew 0x1600).
+                                            # Replies are short (HELLO's 21 bytes, the
+                                            # READ header 11), so 112 bytes to BAUD_PROBE do
 
 
 class BodyAsm(GateAsm):
@@ -579,6 +621,22 @@ def _perm(a):
     a.label("perm")
     a.andis_(5, 3, 0x8000)
     a.bne("perm_mpc")
+    if ALLOW_BOOT_SECTOR:
+        # Emulator-only AIF-wipe experiment: open the 96 KB boot sector
+        # [0x8000, 0x20000) to ERASE/CHUNK so the host can wipe the AIF and
+        # stream the boot content back. OFF on every shipped body -- erasing
+        # this sector takes the loader with it, so an aborted session bricks
+        # until a bench recovery. See tools/aif_wipe_flasher.py.
+        a.li32(5, PERM_LOW)
+        a.cmplw(3, 5)
+        a.blt("perm_std")                  # below the window: normal rules
+        a.li32(5, 0x20000)
+        a.add(6, 3, 4)
+        a.cmplw(6, 5)
+        a.bgt("perm_std")                  # spills past it: normal rules
+        a.li(3, 0)                         # fully inside the boot sector: allow
+        a.blr()
+    a.label("perm_std")
     a.li32(5, 0x40000)
     a.cmplw(3, 5)
     a.blt("perm_bad")
@@ -941,7 +999,7 @@ def _cmf_program(a):
 def _hello_payload(a):
     """Stage the 16-byte stamp (read straight out of ext) at REPLY+4."""
     a.li32(31, SRAM_BASE + REPLY_OFF + 4)
-    a.li32(3, EXT + STAMP_AT)
+    a.li32(3, EXT + STAMP_SRC)
     a.li(4, 16)
     a.label("hello_copy")
     a.lbz(5, 0, 3)
@@ -1050,6 +1108,11 @@ def build_body():
     a.beq("op_setbaud")
     a.cmplwi(3, S_CHUNKSET)
     a.beq("op_chunkset")
+    if ALLOW_BOOT_SECTOR:
+        a.cmplwi(3, S_AIF)
+        a.beq("op_aif")
+        a.cmplwi(3, S_READ)
+        a.beq("op_read")
     _nak_r(a, 6, "cmd")                     # unknown service
 
     a.label("op_hello")
@@ -1093,6 +1156,25 @@ def build_body():
     a.bne("e_nak")
     a.andis_(5, 24, 0x8000)
     a.bne("e_mpc")                          # v2: the MPC window
+    if ALLOW_BOOT_SECTOR:
+        # A boot-sector erase takes the loader with it, so it is refused
+        # unless the AIF-wipe resume marker is armed first (op_aif, AIF_ARM).
+        # That couples arm-before-erase: an interrupt after this point always
+        # leaves an armed marker the host finds on reconnect and converges.
+        a.li32(5, BOOT_SECTOR)
+        a.cmplw(24, 5)
+        a.blt("e_do")                       # below the boot sector: no gate
+        a.li32(5, BOOT_SECTOR_END - 1)
+        a.cmplw(24, 5)
+        a.bgt("e_do")                       # above it: no gate
+        a.bl("aif_cur")                     # in the boot sector: the current
+        a.cmplwi(6, 0)                      # marker slot must be armed
+        a.beq("e_nak")                      # every slot spent
+        a.lhz(6, 0, 6)
+        a.li32(7, MARK_ARMED)               # li32: 0xA55A must not sign-extend
+        a.cmplw(6, 7)
+        a.bne("e_nak")                      # not armed -> perm NAK 1
+    a.label("e_do")
     a.li32(3, EXT)
     a.add(3, 3, 24)
     a.bl("erase_at")
@@ -1150,6 +1232,24 @@ def build_body():
     a.bl("perm")
     a.cmplwi(3, 0)
     a.bne("ck_perm")
+    if ALLOW_BOOT_SECTOR:
+        # v12: a CHUNK into the boot sector only while the current marker
+        # slot is armed -- the window is shut to everything but the AIF wipe
+        # (a v10 body took the old line test's CHUNKs over the loader)
+        a.li32(5, BOOT_SECTOR)
+        a.cmplw(24, 5)
+        a.blt("ck_open")
+        a.li32(5, BOOT_SECTOR_END - 1)
+        a.cmplw(24, 5)
+        a.bgt("ck_open")
+        a.bl("aif_cur")
+        a.cmplwi(6, 0)
+        a.beq("ck_perm")
+        a.lhz(6, 0, 6)
+        a.li32(7, MARK_ARMED)
+        a.cmplw(6, 7)
+        a.bne("ck_perm")
+        a.label("ck_open")
     a.li32(3, RXBUF + 16)
     a.mr(4, 26)
     a.bl("crc32")
@@ -1394,6 +1494,172 @@ def build_body():
     a.li(4, S_MARKS | 0x40)
     a.bl("send_reply")
     a.b("cmd")
+
+    # ---- AIF: the boot-wipe resume marker (built only with the window) --
+    if ALLOW_BOOT_SECTOR:
+        a.label("op_aif")
+        a.li32(3, RXBUF)
+        a.lbz(24, 4, 3)                     # subcommand
+        a.cmplwi(24, AIF_READ)
+        a.beq("aif_read")
+        a.cmplwi(24, AIF_ARM)
+        a.beq("aif_arm")
+        a.cmplwi(24, AIF_DONE)
+        a.beq("aif_done")
+        _nak_r(a, 6, "cmd")                 # bad subcommand
+        a.label("aif_read")                 # reply with the current slot
+        a.bl("aif_cur")
+        a.li32(5, MARK_DONE)                # every slot spent: DONE
+        a.cmplwi(6, 0)
+        a.beq("aif_read_r")
+        a.lhz(5, 0, 6)
+        a.label("aif_read_r")
+        a.mr(6, 5)
+        a.li32(5, SRAM_BASE + REPLY_OFF + 4)
+        a.sth(6, 0, 5)
+        a.li(3, 2)
+        a.li(4, S_AIF | 0x40)
+        a.bl("send_reply")
+        a.b("cmd")
+        a.label("aif_arm")                  # 0xFFFF -> 0xA55A, only on a blank slot
+        a.li32(4, MARK_ARMED)
+        a.li32(9, 0xFFFF)
+        a.b("aif_prog")
+        a.label("aif_done")                 # 0xA55A -> 0xA558, only on an armed one
+        a.li32(4, MARK_DONE)
+        a.li32(9, MARK_ARMED)
+        a.label("aif_prog")
+        a.bl("aif_cur")                     # r4, r9 survive it
+        a.cmplwi(6, 0)
+        a.beq("aif_fail")                   # every slot spent
+        a.lhz(5, 0, 6)                      # the slot must hold what this step
+        a.cmplw(5, 9)                       # follows: never program over
+        a.bne("aif_fail")                   # anything else (another build's tail)
+        a.li32(3, EXT)
+        a.li(14, 0xAA)
+        a.li(15, 0x55)
+        a.li(16, 0xA0)
+        program_halfword(a, "aifm", polls=20000, fail="aif_fail")
+        a.li(3, 0)
+        a.li(4, S_AIF | 0x40)
+        a.bl("send_reply")
+        a.b("cmd")
+        a.label("aif_fail")                 # the marker halfword would not take
+        _nak_r(a, 4, "cmd")
+
+        # ---- READ (v13): raw bytes of ext or the MPC window ---------------
+        # Request: offset (u32, bit 31 = the MPC window), length (u16, 1..4096).
+        # Reply: a long frame [00 span(2) 12 F1 svc] crc32(4) data sum -- the
+        # data streams straight from the array (no buffer: the reply area
+        # holds ~500 bytes), and its CRC lets the host check every block.
+        # Any address reads: the whole chip and the whole MPC, boot included.
+        a.label("op_read")
+        # r28-r31 are the SCI registers (send_bytes needs them); r14-r19 are the
+        # flash macros'. This handler keeps its live values in r22-r24, which
+        # send_bytes and its callees (r3-r9, r27) never touch: r23 the array
+        # pointer, r24 the length, r22 the running checksum; r31 the reply head.
+        a.li32(3, RXBUF)
+        a.lwz(24, 4, 3)                     # offset
+        a.lhz(23, 8, 3)                     # length (-> r24 after the checks)
+        a.cmplwi(23, 0)
+        a.beq("rd_mal")
+        a.cmplwi(23, READ_MAX)
+        a.bgt("rd_mal")
+        a.andis_(5, 24, 0x8000)
+        a.bne("rd_mpc")
+        a.add(6, 24, 23)
+        a.li32(7, 0x100000)
+        a.cmplw(6, 7)
+        a.bgt("rd_bad")
+        a.b("rd_ok")
+        a.label("rd_mpc")
+        a.rlwinm(5, 24, 0, 1, 31)
+        a.add(6, 5, 23)
+        a.li32(7, 0x70000)
+        a.cmplw(6, 7)
+        a.bgt("rd_bad")
+        a.label("rd_ok")
+        a.mr(3, 24)                         # the offset, before r24 takes the length
+        a.mr(24, 23)                        # r24 = length (r23 was holding it)
+        a.bl("base")                        # r3 = the array address
+        a.mr(23, 3)                         # r23 = array pointer (survives send)
+        a.mr(4, 24)                         # crc32 takes r3 (ptr), r4 (len)
+        a.bl("crc32")                       # r3 = crc of the bytes
+        a.mr(25, 3)                         # r25 = crc (survives the stores below)
+        a.li32(31, SRAM_BASE + REPLY_OFF)
+        a.li(5, 0)
+        a.stb(5, 0, 31)                     # long form
+        a.addi(6, 24, 8)                    # span = tgt src svc + crc4 + data + sum
+        a.rlwinm(5, 6, 24, 24, 31)
+        a.stb(5, 1, 31)
+        a.stb(6, 2, 31)
+        a.li(5, 0x12)
+        a.stb(5, 3, 31)
+        a.li(5, 0xF1)
+        a.stb(5, 4, 31)
+        a.li(5, S_READ | 0x40)
+        a.stb(5, 5, 31)
+        a.rlwinm(5, 25, 8, 24, 31)          # crc, big-endian, byte by byte
+        a.stb(5, 6, 31)                     # (no unaligned word store)
+        a.rlwinm(5, 25, 16, 24, 31)
+        a.stb(5, 7, 31)
+        a.rlwinm(5, 25, 24, 24, 31)
+        a.stb(5, 8, 31)
+        a.stb(25, 9, 31)
+        a.li(22, 0)                         # r22 = sum over [3, 9] and the data
+        a.addi(20, 31, 3)
+        a.addi(21, 31, 10)
+        a.label("rd_hsum")
+        a.lbz(5, 0, 20)
+        a.add(22, 22, 5)
+        a.addi(20, 20, 1)
+        a.cmplw(20, 21)
+        a.bne("rd_hsum")
+        a.mr(20, 23)                        # over the data, from the array
+        a.mr(21, 24)
+        a.label("rd_dsum")
+        a.lbz(5, 0, 20)
+        a.add(22, 22, 5)
+        a.addi(20, 20, 1)
+        a.addic_(21, -1)
+        a.bne("rd_dsum")
+        a.stb(22, 10, 31)                   # the sum byte (low 8 bits)
+        a.li32(3, REPLY_GAP)                # the same quiet as every reply
+        a.label("rd_gap")
+        _swsr(a)
+        a.addic_(3, -1)
+        a.bne("rd_gap")
+        a.mr(3, 31)
+        a.li(4, 10)
+        a.bl("send_bytes")                  # header + crc
+        a.mr(3, 23)
+        a.mr(4, 24)
+        a.bl("send_bytes")                  # the data, from the array
+        a.addi(3, 31, 10)
+        a.li(4, 1)
+        a.bl("send_bytes")                  # the sum
+        a.b("cmd")
+        a.label("rd_bad")
+        _nak_r(a, 1, "cmd")
+        a.label("rd_mal")
+        _nak_r(a, 6, "cmd")
+
+        # r6 = the current marker slot (the first not reading MARK_DONE), or 0
+        # when all MARK_SLOTS are spent. Clobbers r5, r7, r8 only.
+        a.label("aif_cur")
+        a.li32(6, EXT + MARK_AT)
+        a.li(7, MARK_SLOTS)
+        a.li32(8, MARK_DONE)
+        a.label("aif_cur_next")
+        a.lhz(5, 0, 6)
+        a.cmplw(5, 8)
+        a.bne("aif_cur_ret")
+        a.addi(6, 6, 2)
+        a.addic_(7, -1)
+        a.bne("aif_cur_next")
+        a.li(6, 0)
+        a.label("aif_cur_ret")
+        a.blr()
 
     # ---- RESET: reply, then starve the watchdog -------------------------
     a.label("op_reset")
