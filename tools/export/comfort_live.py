@@ -6,7 +6,7 @@ the DME really does and not a profile's guess. Each gets a plain name from
 the XDF's description, grouped by the program's naming families.
 
     .venv/bin/python -m tools.export.comfort_live [--image session1.livetune7] \
-        --js ../inpa-mac-bridge/app/renderer/screens/tuning/comfort-live.js
+        --js ../inpa-mac-bridge/app/renderer/core/generated/comfort-live.js
 """
 import argparse
 import json
@@ -77,7 +77,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--image", default="session1.livetune7", help="the live-tune pair in images/ (name)")
     ap.add_argument("--xdf", help="the XDF (default: the one images/ holds for the program)")
-    ap.add_argument("--js", required=True, help="write BMWeb's screens/tuning/comfort-live.js here")
+    ap.add_argument("--js", required=True, help="write BMWeb's core/generated/comfort-live.js here")
     args = ap.parse_args()
     pair = load_named(args.image)
     xdf = Xdf(args.xdf) if args.xdf else Xdf.find(pair)

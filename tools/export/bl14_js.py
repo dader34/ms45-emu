@@ -5,7 +5,7 @@ park-path hook, tools/bl15.py. The blob keeps its name, bl14Blob.)
 
 Run from the ms45-emu root: .venv/bin/python -m tools.export.bl14_js
 
-Writes inpa-mac-bridge/app/renderer/core/flash/bl14-blob.js (bl14Blob):
+Writes inpa-mac-bridge/app/renderer/core/generated/bl14-blob.js (bl14Blob):
 
   installer  the v13 resident body with its write window opened down to
              0x4000 (flasher_body.PERM_LOW, stamp flags bit 2), spliced in
@@ -43,7 +43,7 @@ from tools.export import fast_flasher_js
 from tools.build.flasher_gate import hook_word
 
 OUT = os.path.normpath(os.path.join(
-    ROOT, "..", "inpa-mac-bridge", "app", "renderer", "core", "flash", "bl14-blob.js"))
+    ROOT, "..", "inpa-mac-bridge", "app", "renderer", "core", "generated", "bl14-blob.js"))
 LINE = 64                       # bytes a hex string
 
 

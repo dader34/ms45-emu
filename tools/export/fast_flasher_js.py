@@ -19,7 +19,7 @@ The checksum/signature bytes build() also rewrites are NOT recorded: BMWeb
 redoes those itself from the spliced image, so baking in this one image's
 sums would be wrong for any other car. The output is the body only.
 
-    python3 -m tools.export.fast_flasher_js            # -> ../inpa-mac-bridge/.../fast-flasher-blob.js
+    python3 -m tools.export.fast_flasher_js            # -> ../inpa-mac-bridge/.../generated/fast-flasher-blob.js
     python3 -m tools.export.fast_flasher_js --stdout   # print it
 
 Re-run whenever the flasher body changes.
@@ -36,7 +36,7 @@ from tools.build import flasher_gate as g
 DEFAULT_OUT = os.path.normpath(
     os.path.join(
         ROOT, "..", "inpa-mac-bridge", "app", "renderer",
-        "core", "flash", "fast-flasher-blob.js",
+        "core", "generated", "fast-flasher-blob.js",
     )
 )
 
@@ -139,7 +139,7 @@ def render_js(runs, hook, symbol="fastFlasherBlob", aifwipe=False):
 AIFWIPE_OUT = os.path.normpath(
     os.path.join(
         ROOT, "..", "inpa-mac-bridge", "app", "renderer",
-        "core", "flash", "fast-flasher-aifwipe-blob.js",
+        "core", "generated", "fast-flasher-aifwipe-blob.js",
     )
 )
 

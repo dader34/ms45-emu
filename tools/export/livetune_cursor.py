@@ -31,7 +31,7 @@ the axes that had the same variable at every table that used them: a table the
 run never reached (most of them: its conditions were not met) can borrow its
 cursor from there, as a guess.
 
---js writes the same thing packed for BMWeb (core/ms45/ms45-cursor-map.js).
+--js writes the same thing packed for BMWeb (core/generated/ms45-cursor-map.js).
 """
 import argparse
 import bisect

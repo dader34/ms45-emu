@@ -4,7 +4,7 @@ tune) instead of a pair built here.
 
 Run from the ms45-emu root: .venv/bin/python -m tools.export.livetune_js
 
-Writes inpa-mac-bridge/app/renderer/core/flash/livetune-blob.js
+Writes inpa-mac-bridge/app/renderer/core/generated/livetune-blob.js
 (liveTuneBlob). Everything live tune adds is independent of the tune it
 carries (tools/livetune_build.py's four layers on the stock program, checked
 here by building on two different calibrations) except the fold's golden
@@ -40,7 +40,7 @@ from ms45emu.checksums import crc32_mpeg2
 from ms45emu.image import IMAGES_DIR, Pair, load_named
 
 OUT = os.path.normpath(os.path.join(
-    ROOT, "..", "inpa-mac-bridge", "app", "renderer", "core", "flash", "livetune-blob.js"))
+    ROOT, "..", "inpa-mac-bridge", "app", "renderer", "core", "generated", "livetune-blob.js"))
 BASE = "session1clean"                     # the stock program under session1's tune
 OLDER = {"livetune6": "session1.livetune6", "livetune6-notraps": "session1.livetune6-notraps"}
 VERSION, NAME = 7, "livetune7"
