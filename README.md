@@ -39,7 +39,7 @@ still keeps up with and which runs faster than real time.
 The DME is on its CAN bus as well: it sends the real DME1-4 frames
 (0x316 with the rpm the cluster shows, every 10 ms) and takes the ASC,
 cluster and gearbox frames in; `ms45emu/e46.py` plays those partners.
-`tools/bench.py` puts the emulated DME on a real bus through a USB-CAN
+`tools/bench/bench.py` puts the emulated DME on a real bus through a USB-CAN
 adapter (python-can), so a cluster on the bench, or the car with its DME
 unplugged, follows the emulator.
 
@@ -52,7 +52,7 @@ DME's diagnostics run on it: identification, the RSA authentication, and
 programming mode, where the DME's own boot loader erases and programs the
 external flash chip and the MPC555's internal flash, checks its checksums
 and signatures, and after a reset starts what it was given. See
-`docs/flashing.md`. `tools/kline.py` puts that K line where a tester can
+`docs/flashing.md`. `tools/bench/kline.py` puts that K line where a tester can
 reach it: a pseudo-terminal, a real USB serial adapter (`--port`), a Unix
 socket for a virtual machine's serial port (`--socket`), or a WebSocket
 with a Web Serial stand-in for testers that run in a browser (`--ws`,
@@ -61,7 +61,7 @@ with a Web Serial stand-in for testers that run in a browser (`--ws`,
 Logging is the other use of the K line. The stock program already goes to
 115200 baud and a shorter timing in its default session and reads a packet
 the tester defines, 50 times a second instead of 10; `docs/logging.md` has
-the requests. `ms45emu/diagpatch.py` (`tools/diagpatch.py`) builds a patch
+the requests. `ms45emu/diagpatch.py` (`tools/build/diagpatch.py`) builds a patch
 that doubles that again, adds a log frame on CAN every 10 ms and a buffer
 with a record per crank segment, and it is tested here the way the map
 switch is.
@@ -81,7 +81,7 @@ BMW's data files are taken as they are. A program (`.0PA`) and a
 calibration (`.0DA`) have no boot loader, so they are written over a
 read's, the way a tester would write them (`ms45emu/daten.py`):
 
-    MS45_FLASH=read_Flash.bin .venv/bin/python tools/kline.py --pair stock --program MDS451/7549388A.0PA
+    MS45_FLASH=read_Flash.bin .venv/bin/python -m tools.bench.kline --pair stock --program MDS451/7549388A.0PA
 
 A program brings the whole MPC flash, so the read needs only its external
 flash, and of that only the boot loader: with its first 256 KB kept as
@@ -129,13 +129,14 @@ pedals as the trigger, the shifter pair what it saves with the gear lever.
 - `ms45emu/sci.py`, `ms45emu/kwp.py`  the K line and a KWP tester (diagnostics, flashing)
 - `ms45emu/diagpatch.py`  the diagnostic patch: faster K-line logging, CAN log frame, capture buffer
 - `ms45emu/e46.py`      the other modules on the E46's bus
-- `tools/bench.py`      the DME on a real CAN adapter
-- `tools/diagpatch.py`  builds the diagnostic patch onto a pair
-- `tools/xref.py`       who reads and writes an address, asked of the running program (`ms45emu/xref.py`)
-- `tools/funcmap.py`    the program's functions: a sweep of the code, coverage from a run, names from `ms45emu/names/`, a Ghidra symbol export (`ms45emu/funcmap.py`)
-- `tools/protections.py` what a custom program trips that the stock one does not: faults (`ms45emu/faults.py`), limp home, a reset; and the static table of every check (`ms45emu/protections.py`, `docs/protections.md`)
-- `tools/explain.py`    a routine's calibration items by XDF name (`ms45emu/xdf.py`; the XDF goes in `images/` or `MS45_XDF`), RAM variables and callees, from a scan of its code and, with `--run`, from watching it run (`ms45emu/explain.py`)
-- `tools/kline.py`      the DME's K line on a serial port, socket or WebSocket (`tools/webserial-emu.js` is the browser side)
+- `tools/`              the scripts, by kind, each run from the root as a module (`.venv/bin/python -m tools.<kind>.<name>`):
+  - `build/`        the patches and images: the bootloader rings (`bl14`, `bl15`), the flasher body and gate, live tune, the protections, the diagnostic patch
+  - `export/`       what BMWeb carries as generated files: the flasher, bootloader and live tune blobs, the Comfort "Always live" group, the cursor and value maps
+  - `proofs/`       the emulator suites that gate what goes on the car (`make proofs` runs them all)
+  - `bench/`        the DME on a K line, a WebSocket or a CAN adapter: `kline` (with `webserial-emu.js`, the browser side) and `bench`
+  - `analysis/`     reverse-engineering tools that ask the running program questions: `xref`, `funcmap`, `explain`, `protections`, `table_map`, `site_scan`, `scaling_sweep`, the RAM audits
+  - `experiments/`  one-off investigations kept for their findings (the AIF wipe, granular erase, the boot-region proof of concept, the live tune milestones)
+- `Makefile`            `make test` (pytest), `make proofs`, `make export` (regenerate BMWeb's generated files), `make maps` (the two slow exporters)
 - `tests/`              the checks, one file per subject (`test_boot.py` is the full boot; the ignition-off round trip and the full program flash need `MS45_SLOW=1`)
 - `docs/`               notes on the full boot, flashing and logging
 
