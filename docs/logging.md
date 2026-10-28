@@ -34,9 +34,9 @@ A 30-byte packet (`21 F0`), one read after another:
 
 ## The patch
 
-`ms45emu/diagpatch.py` builds it, `tools/diagpatch.py` writes the files:
+`ms45emu/diagpatch.py` builds it, `tools/build/diagpatch.py` writes the files:
 
-    .venv/bin/python tools/diagpatch.py --flash Flash.bin --mpc MPC.bin --out DIR
+    .venv/bin/python -m tools.build.diagpatch --flash Flash.bin --mpc MPC.bin --out DIR
 
 It replaces two `bl` instructions in the internal flash and puts 368 bytes
 of code in the unused end of the external program area:
@@ -89,7 +89,7 @@ polled). Identifier `0x7A0` by default.
 
 `build(pair, can_id=..., can_fields=...)` takes other variables (any RAM
 address; 16-bit ones at even offsets), `can_id=None` leaves the frame out.
-`tools/bench.py` passes it to a real bus like the DME's own frames.
+`tools/bench/bench.py` passes it to a real bus like the DME's own frames.
 
 ### The capture buffer
 

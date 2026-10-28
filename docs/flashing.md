@@ -7,7 +7,7 @@ the checksums, the RSA signature checks and the decision what to start
 after a reset are all the DME's own boot loader running against models of
 the two flash memories.
 
-`ms45emu/kwp.py` (`Tester`) drives it from Python; `tools/kline.py` puts
+`ms45emu/kwp.py` (`Tester`) drives it from Python; `tools/bench/kline.py` puts
 the K line on a serial port for EDIABAS, INPA or the flasher app.
 
     from ms45emu import load_pair
@@ -129,7 +129,7 @@ starts where the CPU does. If the marks are missing the new board leaves
 the program bytes untouched, so the loader's checksum and signature checks
 still see what was flashed.
 
-`tools/kline.py` does the same for an ignition cycle (`i`, or
+`tools/bench/kline.py` does the same for an ignition cycle (`i`, or
 `/ignition/off` and `/ignition/on` on its `--ws` port). A flash that was
 interrupted leaves the loader in its programming session at 115200 baud,
 status `07`, deaf to a tester that starts over at 9600; ignition off
@@ -154,7 +154,7 @@ to the compressed table at 0 is `BBCMCR[ETRE]`, which `Cpu` now follows.
   from the saved file.
 - Timing is not modelled: erase and program are instant, so a flash is
   limited by the K line (about 5 KB/s at 115200 baud). Through
-  `tools/kline.py` a tester's own pause after each answer comes on top
+  `tools/bench/kline.py` a tester's own pause after each answer comes on top
   (BMWeb: 25 ms, 77 ms a block in all); `--turbo` runs the DME ahead of
   the wall clock while a telegram is in flight, 47 ms a block.
 - The AIF write (`3D`) after a flash has not been tried.
