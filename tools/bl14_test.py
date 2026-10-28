@@ -104,11 +104,15 @@ def hello_wait(s, note, payload=None):
 def reg_dump(b):
     regs = [b.m.reg(i) for i in range(32)]
     extra = {}
+    # CTR and XER are extras: a unicorn build without them leaves them out
     try:
-        from unicorn import UC_PPC_REG_CTR, UC_PPC_REG_XER
+        from unicorn import UC_PPC_REG_CTR, UC_PPC_REG_XER, UcError
+    except ImportError:
+        return regs, extra
+    try:
         extra["CTR"] = b.m.mu.reg_read(UC_PPC_REG_CTR)
         extra["XER"] = b.m.mu.reg_read(UC_PPC_REG_XER)
-    except Exception:
+    except UcError:
         pass
     return regs, extra
 
