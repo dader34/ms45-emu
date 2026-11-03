@@ -144,7 +144,8 @@ class Cpu:
             self.rfi_sites |= find_rfi(image, base)
         self.msr_sprs = {a: v[1] for a, v in self.trap_sites.items() if v[0] == "msr"}
         self.sc_sites = {}                    # pc after the sc -> site description
-        self.patched = {}                     # address -> original word, for flash_pair
+        self.patched = {}
+        self.stubbed = {}                     # at -> the word the emulator put there                     # address -> original word, for flash_pair
         self._patch_trap_sites()
 
     def _patch(self, at, word):
@@ -156,6 +157,7 @@ class Cpu:
         if at not in self.patched:
             self.patched[at] = self.m.read32(at)
         self.m.write32(at, word)
+        self.stubbed[at] = word
 
     def _patch_trap_sites(self):
         m = self.m
@@ -177,8 +179,17 @@ class Cpu:
             m, self.sc_sites, self.images, self._patch)
         self.msr_const_sites = clear_relocation_bits(m, self.images, self._patch)
         if self.program:
-            from .checksums import refresh_program_sums
+            from .checksums import refresh_program_sums, BOOT_CRC
+            # the boot block's CRC word is refreshed over the patched view
+            # too; it lies in the boot region the ring proofs READ back and
+            # compare with the chip, so its silicon value is remembered like
+            # a patch (Board.flash_pair puts it back)
+            for at in (BOOT_CRC, BOOT_CRC - 0x100000):
+                if at not in self.patched:
+                    self.patched[at] = m.read32(at)
             refresh_program_sums(m)
+            for at in (BOOT_CRC, BOOT_CRC - 0x100000):
+                self.stubbed[at] = m.read32(at)
 
     def _msr_stub(self, spr, back):
         """mtspr SPRG0,r3; mfmsr r3; <edit>; mtmsr r3; mfspr r3,SPRG0; ba back.

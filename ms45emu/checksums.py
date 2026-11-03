@@ -1,6 +1,14 @@
 """The program's own integrity checks, recomputed over the image as loaded
 in the emulator (which has had its EIE/EID sites patched).
 
+- Boot block CRC ("ROM test level 1", the first phase of the background
+  walker fn_FFFD9E68): CRC-32/MPEG-2 over the range the words at flash
+  0x1F808 (start) and 0x1F80C (end, inclusive) name -- 0xFFF00000-0xFFF1EFFF,
+  the vectors, the loader and the boot sector up to the sector table --
+  seeded from 0x1F9F0, stored at flash 0x1F800. Stale, it fails the
+  self-check (code 11) and the DME resets itself every walk, ~5 s: the
+  car's reset loop of 2026-10-28 was a BL ring in that range with the
+  stock word left at 0x1F800.
 - Program CRC: CRC-32/MPEG-2 over MPC 0x00000-0x6FFFF then external flash
   0x60608-0xFFF3F, stored at flash 0x60000 and 0x60340.
 - Safety monitor code sum ("ROM test level 2"): 64-bit sum of big-endian
@@ -27,6 +35,17 @@ EXT = 0xFFF00000
 ROMTEST_SUM = EXT + 0x60600
 ROMTEST_RANGES = EXT + 0x60608
 PROGRAM_CRC = (EXT + 0x60000, EXT + 0x60340)
+BOOT_CRC = EXT + 0x1F800                  # stored word; start/end words at +8/+0xC, seed at +0x1F0
+BOOT_CRC_OFFSET, BOOT_CRC_RANGE_OFFSET, BOOT_CRC_INIT_OFFSET = 0x1F800, 0x1F808, 0x1F9F0
+
+
+def boot_crc(m):
+    """The boot block's CRC over the range its own table names, or None
+    when the table is blank (no such check on this loader)."""
+    start, end = m.read32(BOOT_CRC + 8), m.read32(BOOT_CRC + 0xC)
+    if start == 0xFFFFFFFF:
+        return None
+    return crc32_mpeg2(m.read(start, end - start + 1), m.read32(BOOT_CRC + 0x1F0))
 
 
 def program_crc(m):
@@ -47,13 +66,18 @@ def romtest_sum(m):
 
 
 def refresh_program_sums(m):
-    """Store sums matching the loaded image, in both flash mirrors."""
+    """Store sums matching the loaded image, in both flash mirrors: the
+    program's and the boot block's (the emulator's site patches sit in
+    both ranges)."""
     crc = program_crc(m)
     total = romtest_sum(m)
+    boot = boot_crc(m)
     for mirror in (0, -0x100000):
         for a in PROGRAM_CRC:
             m.write32(a + mirror, crc)
         m.write(ROMTEST_SUM + mirror, struct.pack(">Q", total))
+        if boot is not None:
+            m.write32(BOOT_CRC + mirror, boot)
 
 
 # ---- the same sums over a pair's files, for building patched images ---------
@@ -77,6 +101,26 @@ def _image_bytes(flash, mpc, start, length):
 
 def image_program_crc(flash, mpc):
     return crc32_mpeg2(flash[PROGRAM_CRC_RANGE[0]:PROGRAM_CRC_RANGE[1]], crc32_mpeg2(mpc))
+
+
+def image_boot_crc(flash):
+    """The boot block's CRC over the range the image's own table names
+    (ext offsets, the CPU's 0xFFF00000 dropped), or None when the table
+    is blank."""
+    start, end = struct.unpack_from(">II", flash, BOOT_CRC_RANGE_OFFSET)
+    if start == 0xFFFFFFFF:
+        return None
+    init = struct.unpack_from(">I", flash, BOOT_CRC_INIT_OFFSET)[0]
+    return crc32_mpeg2(flash[start - EXT:end - EXT + 1], init)
+
+
+def fix_boot(flash):
+    """Bring the boot block's stored CRC up to date with the boot region as
+    it is now -- after a ring or any other change below 0x1F000. `flash`
+    is a bytearray and is changed in place."""
+    crc = image_boot_crc(flash)
+    if crc is not None:
+        struct.pack_into(">I", flash, BOOT_CRC_OFFSET, crc)
 
 
 def image_romtest_sum(flash, mpc):

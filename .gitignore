@@ -5,7 +5,7 @@ __pycache__/
 images/*
 !images/README.md
 # regeneratable scan/analysis artifacts
-build/
+/build/
 ms45emu.egg-info/
 .DS_Store
 .claude/

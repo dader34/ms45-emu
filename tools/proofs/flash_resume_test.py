@@ -1,11 +1,11 @@
-"""Interruptible flashing: the DME-truth resume protocol, proven on BL15.
+"""Interruptible flashing: the DME-truth resume protocol, proven on BL.
 
 Run from the ms45-emu root: .venv/bin/python -m tools.proofs.flash_resume_test
 
 The app's resume today (fbDmeFastPushWithResume) assumes the connection
 died but the DME stayed powered: it knows how far it got. A power cut
 kills that knowledge. The protocol proven here derives everything from
-what the DME itself reports after BL14's line-hold re-entry, so the same
+what the DME itself reports after BL's line-hold re-entry, so the same
 code resumes a cable pull, a laptop battery death, and an ignition cycle:
 
   - ERASE DISCRIMINATOR: SECTOR_QUERY of the pushed range's tail slice.
@@ -25,11 +25,11 @@ code resumes a cable pull, a laptop battery death, and an ignition cycle:
     (bit-clear of the same halfwords), so resuming an already-finished
     session writes nothing and burns nothing extra.
 
-Re-entry (why BL15, not BL14): BL14's window hangs off the handoff word
+Re-entry (why BL, not BL): BL's window hangs off the handoff word
 at 0x4EBC, which the loader executes only when its own validity checks
 pass. A power cut mid-push leaves the cal unverifiable, so the loader
 calls its factory-KWP park at 0x5228 and the window never ran -- case C
-could not even reconnect. BL15 adds one patched word at the park
+could not even reconnect. BL adds one patched word at the park
 function's head (same 8 KB sector): the park window is inert when the
 line is free (proven in section H: every GPR identical at the stock
 prologue, the stream byte-identical through the first time-driven tick)
@@ -47,8 +47,7 @@ import struct
 import sys
 import time
 
-from tools.build import bl14
-from tools.build import bl15
+from tools.build import bl
 from ms45emu.image import load_named
 from ms45emu.board import Board
 from ms45emu.checksums import crc32_mpeg2
@@ -56,7 +55,7 @@ from ms45emu.fold import CRC_AT, CRC_FROM, CRC_TO, MON_AT, monitor_sum
 from tools.build.flasher_body import SRAM_BASE, REPLY_OFF
 from tools.proofs.flasher_session_test import (Session, lit_nrv2b, expect,
                                   fast_waits)
-from tools.proofs.bl14_test import (hello_wait, taken, taken_from_reset,
+from tools.proofs.bl_test import (hello_wait, taken, taken_from_reset,
                        CHUNK, CAL, CAL_END)
 from tools import ROOT
 
@@ -188,7 +187,7 @@ def main():
     t0 = time.time()
     global bl_f
     pair = load_named("session1.livetune6-notraps")
-    bl_f, bl_m = bl15.build(pair.flash, pair.mpc)
+    bl_f, bl_m = bl.build(pair.flash, pair.mpc)
 
     # the push model: flasher_session_test's target -- a modified cal that
     # boots -- with the cal marks left blank so MARKS is a real transition
@@ -213,7 +212,7 @@ def main():
         print("  note: this image's pushed tail is NOT blank")
 
     board, s = taken(bl_f, bl_m, "resume", deep=True)
-    hello_wait(s, "resume session", bl15.stamp_bytes())
+    hello_wait(s, "resume session", bl.stamp_bytes(flags=bl.ring_flags()))
 
     # ---- old content, never touched ---------------------------------------
     print("=" * 64, "\nA. OLD CONTENT -- power lost before anything\n" + "=" * 64)
@@ -228,7 +227,7 @@ def main():
     crafted = bytes(target[CAL:CAL + 3 * CHUNK]) + bytes(bl_f[CAL + 3 * CHUNK:CAL_END])
     board2.flash.store(CAL, crafted)             # the power cut left this behind
     b2, s2 = taken_from_reset(board2, "B-reconnect")
-    hello_wait(s2, "B", bl15.stamp_bytes())
+    hello_wait(s2, "B", bl.stamp_bytes(flags=bl.ring_flags()))
     sent, verdict = resume(s2, CAL, target[CAL:CAL_END], "B")
     if "erase" not in verdict or sent != n:
         raise SystemExit(f"FAIL: B said {verdict!r}, {sent} chunks (the prefix was skipped?)")
@@ -243,13 +242,13 @@ def main():
     blank_tail = bytes(target[CAL_END - CHUNK:CAL_END]) == b"\xff" * CHUNK
     for k in (1, 5, 28):
         b, sk = taken_from_reset(board, f"C{k}-cut")
-        hello_wait(sk, f"C{k}", bl15.stamp_bytes())
+        hello_wait(sk, f"C{k}", bl.stamp_bytes(flags=bl.ring_flags()))
         expect(sk.xfer(0x02, struct.pack(">I", CAL)), 0x02, f"C{k}: ERASE (the original push)")
         for i in range(k):
             if not push_chunk(sk, CAL + i * CHUNK, bytes(target[CAL + i * CHUNK:CAL + (i + 1) * CHUNK])):
                 raise SystemExit(f"FAIL: C{k}: the original push lost chunk {i}")
         br, sr = taken_from_reset(b, f"C{k}-reconnect")       # the power cut
-        hello_wait(sr, f"C{k} back", bl15.stamp_bytes())
+        hello_wait(sr, f"C{k} back", bl.stamp_bytes(flags=bl.ring_flags()))
         sent, verdict = resume(sr, CAL, target[CAL:CAL_END], f"C{k}")
         want = 0 if (k == n - 1 and blank_tail) else n - k
         if sent != want:
@@ -260,14 +259,14 @@ def main():
     # ---- a torn chunk: half of chunk 5 took before the cut -----------------
     print("=" * 64, "\nD. TORN CHUNK -- half a chunk programmed, then the cut\n" + "=" * 64)
     b, sk = taken_from_reset(board, "D-cut")
-    hello_wait(sk, "D", bl15.stamp_bytes())
+    hello_wait(sk, "D", bl.stamp_bytes(flags=bl.ring_flags()))
     expect(sk.xfer(0x02, struct.pack(">I", CAL)), 0x02, "D: ERASE (the original push)")
     for i in range(5):
         push_chunk(sk, CAL + i * CHUNK, bytes(target[CAL + i * CHUNK:CAL + (i + 1) * CHUNK]))
     torn = bytes(target[CAL + 5 * CHUNK:CAL + 6 * CHUNK])
     b.flash.store(CAL + 5 * CHUNK, torn[:CHUNK // 2])     # the write died mid-chunk
     br, sr = taken_from_reset(b, "D-reconnect")
-    hello_wait(sr, "D back", bl15.stamp_bytes())
+    hello_wait(sr, "D back", bl.stamp_bytes(flags=bl.ring_flags()))
     sent, verdict = resume(sr, CAL, target[CAL:CAL_END], "D")
     if sent != n - 5:
         raise SystemExit(f"FAIL: D sent {sent} chunks (want {n - 5}): {verdict}")
@@ -277,13 +276,13 @@ def main():
     # ---- foreign bits mid-sector: the partial-erase pathology ---------------
     print("=" * 64, "\nE. FOREIGN BITS -- old content where nothing was pushed\n" + "=" * 64)
     b, sk = taken_from_reset(board, "E-cut")
-    hello_wait(sk, "E", bl15.stamp_bytes())
+    hello_wait(sk, "E", bl.stamp_bytes(flags=bl.ring_flags()))
     expect(sk.xfer(0x02, struct.pack(">I", CAL)), 0x02, "E: ERASE (the original push)")
     for i in range(5):
         push_chunk(sk, CAL + i * CHUNK, bytes(target[CAL + i * CHUNK:CAL + (i + 1) * CHUNK]))
     b.flash.store(CAL + 7 * CHUNK, bytes(bl_f[CAL + 7 * CHUNK:CAL + 8 * CHUNK]))
     br, sr = taken_from_reset(b, "E-reconnect")
-    hello_wait(sr, "E back", bl15.stamp_bytes())
+    hello_wait(sr, "E back", bl.stamp_bytes(flags=bl.ring_flags()))
     sent, verdict = resume(sr, CAL, target[CAL:CAL_END], "E")
     converged(br, target, "E")                    # however it got there, it got there
     board, s = br, sr
@@ -291,19 +290,19 @@ def main():
     # ---- the two post-push points -------------------------------------------
     print("=" * 64, "\nF/G. POST-PUSH -- the cut before VERIFY, and after MARKS\n" + "=" * 64)
     b, sk = taken_from_reset(board, "F-cut")
-    hello_wait(sk, "F", bl15.stamp_bytes())
+    hello_wait(sk, "F", bl.stamp_bytes(flags=bl.ring_flags()))
     expect(sk.xfer(0x02, struct.pack(">I", CAL)), 0x02, "F: ERASE (the original push)")
     for i in range(n):
         push_chunk(sk, CAL + i * CHUNK, bytes(target[CAL + i * CHUNK:CAL + (i + 1) * CHUNK]))
     br, sr = taken_from_reset(b, "F-reconnect")   # everything sent, nothing confirmed
-    hello_wait(sr, "F back", bl15.stamp_bytes())
+    hello_wait(sr, "F back", bl.stamp_bytes(flags=bl.ring_flags()))
     sent, verdict = resume(sr, CAL, target[CAL:CAL_END], "F")
     if sent != 0:
         raise SystemExit(f"FAIL: F re-sent {sent} chunks ({verdict})")
     converged(br, target, "F")
 
     b, sk = taken_from_reset(br, "G-cut")         # a finished session, cut anyway
-    hello_wait(sk, "G", bl15.stamp_bytes())
+    hello_wait(sk, "G", bl.stamp_bytes(flags=bl.ring_flags()))
     before = bytes(b.flash.image)
     sent, verdict = resume(sk, CAL, target[CAL:CAL_END], "G")
     if sent != 0:
@@ -314,7 +313,7 @@ def main():
     converged(b, target, "G")
 
     # ---- the park path: why the mid-push cases could reconnect -------------
-    print("=" * 64, "\nH. PARK PATH -- BL15's second window carries the cut DME\n" + "=" * 64)
+    print("=" * 64, "\nH. PARK PATH -- BL's second window carries the cut DME\n" + "=" * 64)
 
     def parked_pair(img_f, img_m):
         f = bytearray(img_f)
@@ -334,7 +333,7 @@ def main():
         b.m.mu.hook_del(h)
         return b, seq, snap
 
-    v14_f, v14_m = bl14.build(pair.flash, pair.mpc)
+    v14_f, v14_m = pair.flash, pair.mpc        # the STOCK pair: the park window is inert against it
     b14b, seq14, regs14 = park_boot(v14_f, v14_m)
     b15b, seq15, regs15 = park_boot(bl_f, bl_m)
     diff = [i for i in range(32) if regs14[i] != regs15[i]]
@@ -382,7 +381,7 @@ def main():
     if not sp.until(lambda: SRAM_BASE <= pb.m.pc < SRAM_BASE + REPLY_OFF,
                     budget=200_000):
         raise SystemExit(f"FAIL: H: body not in SRAM (pc={pb.m.pc:#x})")
-    hello_wait(sp, "H park entry", bl15.stamp_bytes())
+    hello_wait(sp, "H park entry", bl.stamp_bytes(flags=bl.ring_flags()))
     print("  ok: H: parked + held line -> park window -> body (the C cases' re-entry)")
 
     print("=" * 64)

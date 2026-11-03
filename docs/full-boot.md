@@ -29,7 +29,7 @@ trip is behind `MS45_SLOW=1`.
 CAN runs too (`ms45emu/toucan.py`): module A is the vehicle bus, where
 the DME sends DME1-4 (0x316 every 10 ms with the rpm the cluster shows,
 0x329, 0x545, and 0x338 on events) and receives ASC, cluster and gearbox
-frames; `ms45emu/e46.py` plays those partners, and `tools/bench.py` puts
+frames; `ms45emu/e46.py` plays those partners, and `tools/bench/bench.py` puts
 the DME on a real bus through a python-can adapter.
 
 Not yet: anything the engine needs (TPU microcode, crank/cam), the
@@ -54,7 +54,7 @@ image (`checksums.py`).
   instead of 40 M: a CPU a quarter as fast. The program still keeps its
   schedule there (it does not at 5), and the emulator then runs faster
   than real time, which a tester with real-time timeouts needs
-  (`tools/kline.py` uses it and waits for the wall clock). All periods
+  (`tools/bench/kline.py` uses it and waits for the wall clock). All periods
   below scale with it. One thing does not: a software-started ADC scan
   takes at least 8000 instructions, because the program restarts it from
   its completion interrupt and a slower CPU would otherwise never get to
@@ -163,3 +163,19 @@ image (`checksums.py`).
 | Realistic ADC values per channel | All channels read mid-scale; pedal/brake/speed are forced at the hook in the tests |
 | Watchdog reset | Services are counted but a missed one does nothing |
 | Cam sensors, ignition and injection timing (TPU microcode) | The crank is modelled; with no cam signal the program flags both cam sensors, and the output channels are only acknowledged |
+| Ignition channel state (TPU A0-5 parameter byte 9) | Always 0 here. `ignition_any_status` (`0x18E2C`) and `ignition_channel_handler` read it; the handler's copy (r13-0x750C) decides what each cylinder's task does in `0x37A30`/`0x373D8`. `Coils` runs the pulses but leaves the byte, the angle (word 5) and the duration (word 6) alone |
+| Coil feedback (TPU B10, B12, function 0) | Read by the ignition diagnosis at `0x1A8C0` (bytes 9-11 of each); always 0, so faults 53-64 fail |
+| Serial link on TPU B7/B8 (handlers `0xFFF70E28`, `0xFFF7145C`, interrupts enabled) | A state machine in the external flash (state r13-0x7607) that never gets an edge: most likely the bit-serial link to the alternator. Its consumers (`0xFFF8E604`, 8 KB of power management) never run |
+| TPU A9 period interrupt (handler `0x164D8`, enabled) | Never raised |
+| Brake pins (MIOS `+0x66`, `+0x7E`) | Read as a constant `0x2003` by `brake_throttle_plausibility` |
+| MIOS inputs at `+0x30`, `+0x58` (`0x15690`) and `+0x70`, `+0xF8` (`0x13088`) | Read every 10 ms, always 0: counters or captures with no source |
+| Tasks 13, 14 (cam edges), 15-19 | Never activated in a running scenario; 13/14 wait for the cam interrupts, the others for events not identified yet |
+
+Found by one recorded run (800 then 2500 rpm, the E46 peers on the bus):
+every register access with the routine that made it, every function
+executed. 1171 of 3617 functions ran. The largest that code which did run
+calls and never reached: `0xFFF8E604` (power management), `0x48124`
+(check-control messages), `0x400E4` and `0xFFF75BF8` (VANOS adaption and
+setpoints: they wait for the cams), `0xFFFA53EC` (oil condition).
+`0x1F938`, once named `ignition_fire_b`, is the routine every TPU driver
+requests service through (`tpu_request_service`), not an ignition path.

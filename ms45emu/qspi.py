@@ -21,6 +21,8 @@ task24. All three answer as an open bus until modelled.
 import struct
 
 QSMCM = 0x305000
+PORTQS = QSMCM + 0x14
+PQSPAR = QSMCM + 0x16          # byte; DDRQS is the next byte
 SPCR0 = QSMCM + 0x18
 SPCR1 = QSMCM + 0x1A
 SPCR2 = QSMCM + 0x1C
@@ -33,17 +35,25 @@ QUEUE = 32
 BITSE = 0x40                 # command RAM: use SPCR0[BITS] instead of 8 bits
 
 SPE = 0x8000
+MSTR = 0x8000                # SPCR0: master mode (the only mode the DME uses)
 SPIFIE = 0x8000
 SPIF = 0x80
 
 
+EE_SIZE = 0x1000      # the car's part: a 64 KB read of it (2026-10-28) is the
+                      # same 4 KB sixteen times -- the address wraps at 4 KB
+
+
 class Eeprom25:
     """A 25-series SPI EEPROM with a 16-bit address: READ 03, WRITE 02,
-    WREN 06, WRDI 04, RDSR 05, WRSR 01. Blank (0xFF) unless given an image."""
+    WREN 06, WRDI 04, RDSR 05, WRSR 01. Blank (0xFF) unless given an image.
+    Addresses wrap at `size`, as the car's 4 KB part does; an image longer
+    than the part (an old 64 KB dump) gives its first `size` bytes."""
 
-    def __init__(self, size=0x10000, image=None):
+    def __init__(self, size=EE_SIZE, image=None):
         self.data = bytearray(b"\xff" * size)
         if image:
+            image = bytes(image[:size])
             self.data[:len(image)] = image
         self.write_enabled = False
         self.reads = 0
@@ -115,13 +125,47 @@ class Qspi:
         self.now = now                            # instruction counter, or None: transfers complete at once
         self.ips = ips
         self.done_at = None                       # when the running queue completes (SPIF, interrupt)
+        self.stalled = None                       # why the last SPE went nowhere, or None
         self._done_spsr = 0
         page.on_write(SPCR1, self._spcr1_write)
 
     def _spcr1_write(self, addr, size, value):
         if size == 2 and value & SPE:
+            why = self._unconfigured()
+            if why:
+                # Real silicon: in slave mode the QSPI waits for a clock that
+                # never comes, and a pin the PQSPAR leaves as GPIO carries
+                # nothing; either way SPIF never sets. SPE stays up and the
+                # poller spins (the v15 body's EEPROM read did exactly this
+                # on the car, 2026-10-28: the loader leaves the QSMCM at its
+                # reset state and the body set SPE alone).
+                if not self.log or self.log[-1][0] != "unconfigured":
+                    self.log.append(("unconfigured", why, ""))
+                self.stalled = why
+                return None
             self._transfer()
             return value & ~SPE                   # the queue has run by the time SPE is read back
+        return None
+
+    def _unconfigured(self):
+        """Why a queue cannot run: not master, or the pins not the QSPI's."""
+        p = self.page
+        if not p.peek16(SPCR0) & MSTR:
+            return "SPCR0.MSTR clear: slave mode, no clock"
+        pqspar = p.peek8(PQSPAR)
+        if pqspar & 0x03 != 0x03:
+            return f"PQSPAR {pqspar:#04x}: MISO/MOSI are not the QSPI's"
+        spcr2 = p.peek16(SPCR2)
+        newqp, endqp = spcr2 & 0x1F, (spcr2 >> 8) & 0x1F
+        q = newqp
+        while True:
+            pcs = p.peek8(CMD_RAM + q) & 0xF
+            for n in range(4):                    # the chip select driven low
+                if not pcs & (1 << n) and not pqspar & (1 << (3 + n)):
+                    return f"PQSPAR {pqspar:#04x}: PCS{n} is not the QSPI's"
+            if q == endqp:
+                break
+            q = (q + 1) % QUEUE
         return None
 
     def next_event(self):

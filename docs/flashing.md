@@ -62,7 +62,13 @@ the answer follows on its own. The second status of a block answer
 (`76 <block> 02`) is a failed write.
 
 There is no erase job for the internal flash: erasing the program region
-erases the external program sectors and all of the internal flash.
+erases the external program sectors and all of the internal flash. The
+erase is categorical and the range in the request is ignored -- asked for
+the top 64 KB, the first 64 KB or the internal window, the loader wipes
+the same whole program area plus all of the internal flash every time
+(tools/proofs/bootstrap_probe.py); only the calibration erase is its own
+category. So no partial flash exists to build a small install on: any
+program touch costs the whole program + internal write.
 
 ## What the DME does, and what it needed
 

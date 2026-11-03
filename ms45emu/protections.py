@@ -178,6 +178,12 @@ class Reactions:
             board.probe(MO3_ANSWER, "mo3_answer", on_hit=self._self_check)
             board.probe(MO3_ERROR, "mo3_error", on_hit=lambda bd: self.mo3_errors.update([bd.m.reg(3)]))
         mu.ctl_flush_tb()
+        # the probes replaced words inside the program checksum's range:
+        # the stored sums follow, or every run over ~5 s (one walk) would
+        # report a self-reset of the emulator's own making
+        if board.cpu.program:
+            from .checksums import refresh_program_sums
+            refresh_program_sums(board.m)
         self._last = {addr: board.m.read8(addr) for addr in WATCHED}
 
     def _reported(self, board):

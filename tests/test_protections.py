@@ -12,7 +12,8 @@ from ms45emu.xdf import Xdf
 
 SCENARIO = dict(rpm=800, seconds=0.5, settle=0.5)
 STALE_AT = 0xFFFDC860             # free space inside the program checksum's range, never executed
-STALE_SECONDS = 6
+STALE_BOOT_AT = 0xFFF17000        # blank boot-sector space inside the boot block CRC's range (where a ring goes)
+STALE_SECONDS = 6                 # one walk of the background checksum takes ~5 s
 
 
 @pytest.fixture(scope="module")
@@ -42,14 +43,32 @@ def test_stock_never_fails_its_self_check(stock_reactions):
     assert stock_reactions.self_reset == {}
 
 
+def test_stock_passes_a_full_walk(stock):
+    """The background checksum walks the boot block, the program and the
+    calibration in ~5 s; stock, with the emulator's own patches summed in
+    (Board, then Reactions over its probes), never fails its self-check."""
+    r = Reactions(Board(stock.pair))
+    r.scenario(rpm=0, seconds=STALE_SECONDS, settle=0.5)
+    assert r.self_reset == {}, r.report(Faults(stock.pair))
+
+
 def test_a_stale_program_checksum_is_a_self_reset(stock):
     """One word changed in the program and its sums left as they were: the
     background checksum fails, the pre-answer self-check with it, and the
     DME would reset itself without a code (the start-up resets of an early
     map-switch build)."""
-    b = Board(stock.pair)                 # sums refreshed over the emulator's own patches here ...
-    b.m.write32(STALE_AT, 0x12345678)     # ... and then a word in the program area changed
-    r = Reactions(b)
+    r = Reactions(Board(stock.pair))      # sums refreshed over the emulator's own patches and probes here ...
+    r.board.m.write32(STALE_AT, 0x12345678)   # ... and then a word in the program area changed
+    r.scenario(rpm=0, seconds=STALE_SECONDS, settle=0.5)
+    assert 11 in r.self_reset, r.report(Faults(stock.pair))
+
+
+def test_a_stale_boot_block_crc_is_a_self_reset(stock):
+    """The walk's first phase covers 0x0-0x1EFFF against the word at
+    0x1F800: a ring put in the boot sector without that word recomputed
+    is the same code 11 -- the car's reset loop of 2026-10-28."""
+    r = Reactions(Board(stock.pair))
+    r.board.m.write32(STALE_BOOT_AT, 0x48000000)
     r.scenario(rpm=0, seconds=STALE_SECONDS, settle=0.5)
     assert 11 in r.self_reset, r.report(Faults(stock.pair))
 

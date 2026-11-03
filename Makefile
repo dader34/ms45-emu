@@ -15,8 +15,8 @@ BMWEB ?= ../inpa-mac-bridge
 GEN   := $(BMWEB)/app/renderer/core/generated
 
 PROOFS := gate_test flasher_session_test mpc_session_test nrv2b_emu_test \
-          bl14_test bl14_app_test bl15_restore_test flash_resume_test \
-          aif_editor_test livetune_app_test
+          bl_test bl_app_test bl_restore_test bl_update_test bl_late_entry_test \
+          bootwrite_test flash_resume_test aif_editor_test livetune_app_test
 
 .PHONY: test proofs export maps
 
@@ -30,7 +30,7 @@ proofs:
 
 export:
 	$(PY) -m tools.export.fast_flasher_js
-	$(PY) -m tools.export.bl14_js
+	$(PY) -m tools.export.bl_js
 	$(PY) -m tools.export.livetune_js
 	$(PY) -m tools.export.comfort_live --js $(GEN)/comfort-live.js
 

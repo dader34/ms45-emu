@@ -1,7 +1,7 @@
 # The DME's protections
 
 What the program does when something is wrong, found with the RE tools
-(`tools/xref.py`, `tools/funcmap.py`, `tools/explain.py`) on program
+(`tools/analysis/xref.py`, `tools/analysis/funcmap.py`, `tools/analysis/explain.py`) on program
 `0044570LO02S`, so that a custom program can be checked against them on
 the emulator before it goes near a car. State as of 2026-10-07: the
 reactions are found; the checks that feed them are being enumerated.
@@ -14,7 +14,7 @@ Everything a check can do ends in one of these.
 |---|---|---|
 | A fault entry | `fault_report` (MPC `0x26170`): r3 = fault index, r4 = result bits (`0x10` plus the low bits of the verdict), r5-r7 details. 258 descriptors at MPC `0x45B8` (handler, counter byte at `0x3FDAA1`+i, calibration record at cal `0x8EF8`+0x12·i, status word at `0x3FD106`+4·i, flags). `fault_report_b` (`0x2657C`) is the same without a verdict; `fault_query` (`0x267E4`) asks | `Board.probe` on `fault_report` with `on_hit` reading r3/r4; `ms45emu/faults.py` turns the index into the DTC code (record bytes 10-11) and text |
 | Limp home | the flag `limp_home_flag` (r13-0x4059) and `limp_home` (r13-0x406B), the limiter's limp limit `c_n_max_mtc_lih` | `xref.py 0x3FD797` lists the writers: each is a check |
-| An ignition or injection cut | the ignition-fire sites gated in `ms45emu/protect.py`; the fuel path not yet traced | a run with `--rpm` and the TPU I/O capture |
+| An ignition or injection cut | the entry of `ignition_fire_a` (`0x377A8`), gated in `ms45emu/protect.py`; the fuel path not yet traced | a run with `--rpm`; `Board.coils.sparks` holds the pulses that ran |
 | A reset | the watchdog. It is serviced unconditionally at the very end of `task24` (`0x55A7C`, the 10 ms chain: `0x55D40`/`0x55D4C` write `556C`/`AA39`); nothing in the program withholds it on purpose. A reset therefore means the chain did not finish: an unexpected exception (the handlers at `0xFFF71A9C`.. end in `b .`), a hang, or a jump into erased flash, which is what the earlier limiter hook did | `board.watchdog_services` stops growing; pc in one of the `b .` handlers; `board.other_exceptions` |
 
 Fault indices are the program's own; BMW's DTC codes are the same across
@@ -28,7 +28,7 @@ before a call of `fault_report`:
 
 | DTC | Index | Reporter | What it checks (from `explain`) |
 |---|---|---|---|
-| 2830 P16A0 checksum | 38 | `selftest_checksum` `0xFFFCF2B0`, from task11 | drives the background CRC-32 walker (`fn_FFFD9E68`, the hottest function in coverage; `dme.FLASH_CRC_RETURN`) over the external flash and compares with the stored sums. The map switch's and the patches' sums are refreshed for this (`checksums.py`) |
+| 2830 P16A0 checksum | 38 | `selftest_checksum` `0xFFFCF2B0`, from task11 | drives the background CRC-32 walker (`fn_FFFD9E68`, the hottest function in coverage; `dme.FLASH_CRC_RETURN`) in three phases, each a range named by a table in the flash with its seed and stored word beside it, flag bits in r13-0x7FDE: **the boot block** ("ROM test level 1": `0xFFF00000-0xFFF1EFFF` from the words at `0x1F808/0x1F80C`, seed `0x1F9F0`, stored `0x1F800`), **the program** (MPC `0x0-0x6FFFF` then ext `0x60608-0xFFF3F` from the header at `0x60004-0x60014`, stored `0x60000`) and **the calibration** (table at `0x40108`, skipped when its halfword at `0x40114` is blank). One walk takes ~5 s. Any phase failing sets r13-0x3B8F, the self-reset's code 11 (below): the DME resets every walk and stores 28B2 "reason 11 ROM Test Level 1". The map switch's and the patches' sums are refreshed for this (`checksums.py`); a ring in the boot region must refresh `0x1F800` (`fix_boot`) -- the car's reset loop of 2026-10-28 was BL with that word left stock |
 | 2831 P3238 "Prozessorüberwachung" | 96 | `selftest_processor_monitor` `0x4375C`, from `fn_37FE8` and `fn_5B954` | reads `c_abc_max_eng_psn`, `c_abc_max_tooth_per`, `c_abc_max_tpu_syn` and the crank driver's state: it monitors the TPU, the MPC555's co-processor that runs the crank and the outputs, not an external watchdog chip |
 | 2869 P16A3 RAM check | 206 | `selftest_ram_check` `0xFFFCF1D0` | compares RAM copies (`fn_FFF6969C`, the 287-caller helper) |
 | 2777 ADC | 129 | | |
@@ -55,7 +55,7 @@ is the next thing to establish; the self-test above suggests the
 
 ## The checks
 
-`tools/protections.py --table docs/protections-checks.md` lists every
+`tools/analysis/protections.py --table docs/protections-checks.md` lists every
 check statically (`ms45emu/protections.py`, `Checks`): 124 routines that
 report a fault (the `li r3, index` before a call of `fault_report`) or
 write a limp-home flag or the engine state, with the OS task each runs
@@ -68,7 +68,7 @@ writer of `limp_home_flag`; the self-tests sit in the segment task
 
 ## Checking a custom program
 
-`tools/protections.py --pair X` (or `--flash/--mpc`) boots the pair and
+`tools/analysis/protections.py --pair X` (or `--flash/--mpc`) boots the pair and
 runs a scenario (the crank at `--rpm`, the E46 peers on the bus,
 `--key-off` for the after-run) with `Reactions` watching: the fault
 reporter probed (index, verdict: `0x10` is "tested", a low bit is the
@@ -146,6 +146,23 @@ ignition model has to run the pulse the program schedules (words 0 and
 crank angle, and on completion leave the angle in word 5, the duration
 in word 6, the status in byte 9 and raise the channel's CISR bit.
 Injecting the interrupt alone, with made-up words, sets nothing.
+
+**Who schedules a spark (2026-10-10).** `ignition_fire_a` has two callers.
+The segment task's routine (`0x37928`) calls it at `0x379CC`, for the one
+cylinder that is due or for all six while the phase is not known. And each
+cylinder has a task of its own (stubs at `0x11D74`..`0x11D9C`, in the task
+table at external flash `0xF8BE0`) that runs `0x37A30`, which ends in a
+jump to it (`0x37ABC`). `ignition_channel_handler` starts that task when
+the cylinder's pulse is over, so on a running engine every spark schedules
+the next one and the chain never needs the segment task. The first spark
+cut gated the call at `0x379CC` only (and the two request-2 calls in
+`0x192D8`, which set the channels up and are not sparks): on the car
+nothing was cut, at any temperature. The emulator had passed it because it
+raised no completion interrupt, so the cylinders' tasks never ran. The
+gate now sits at the routine's entry, and `Coils` (`ms45emu/tpu.py`) runs
+one pulse per request and raises the interrupt, without the words the
+handler reads back. Still to see on a car: that a channel with nothing
+scheduled stays quiet, which is the microcode's doing.
 
 The cam channels (A10, A12) never interrupt either: no edges are
 generated, so `cam_handler` (3.5 KB) never runs and the cam checks
@@ -277,5 +294,11 @@ which is the regression test for any limiter-side protection.
    passes and a custom program's SPI traffic can be judged.
 2. Coils and cam signals on the TPU, so the segment task's checks run on
    real inputs.
-3. An EEPROM image with stored-data blocks 3 and 4 valid (a read from a
-   car, or an after-run that writes them), so the RAM check passes.
+3. An EEPROM image with stored-data blocks 3 and 4 valid — done 2026-10-28
+   in the parts that matter: the v14 body reads the whole part through
+   offset bit 30 (`tools/proofs/eeprom_dump_test.py`) and the v15 body
+   writes it back through svc 0x0B (`tools/proofs/ee_write_test.py`,
+   `isn_pairing_test.py`), so the dump a real car needs is one button
+   away. What remains is the read itself on the bench donor, then the
+   block-format RE (which block holds the ISN, the layout for a clean
+   virginize) — docs/EWS-ISN.md in BMWeb-Flasher.

@@ -1,9 +1,9 @@
-"""The BL14 proof suite (docs/bootloader.md §9): inert, taken, session,
+"""The BL proof suite (docs/bootloader.md §9): inert, taken, session,
 survivability, and the installer -- end to end on the emulator.
 
-Run from the ms45-emu root: .venv/bin/python -m tools.proofs.bl14_test
+Run from the ms45-emu root: .venv/bin/python -m tools.proofs.bl_test
 
-1. INERT (P-1): with the line idle, the BL14 image boots the program exactly
+1. INERT (P-1): with the line idle, the BL image boots the program exactly
    as the stock one does. The window costs ~41k insns (~1 ms) and touches
    only r3-r8 (the gate's register discipline, one hop earlier), so the
    register diff at the program's first instruction must be r3-r8 and
@@ -19,46 +19,32 @@ Run from the ms45-emu root: .venv/bin/python -m tools.proofs.bl14_test
    flags 3 (the full v13 feature set).
 3. SESSION (P-5, the load-bearing half of flasher_session_test): the full
    cal push over the wire -- ERASE / CHUNK x29 / VERIFY / MARKS, the failure
-   paths, RESET parking, watchdog, 8E1 -- plus the BL14 properties: the
+   paths, RESET parking, watchdog, 8E1 -- plus the BL properties: the
    ring body refuses an erase of its own boot sector while the marker is
    not armed, and the boot region [0x0, 0x20000) is byte-identical to the
    built image after the whole session (the G3 claim witnessed: a session
    cannot touch the ring). A fresh board then boots the new cal through the
    loader's own checks, and the taken path still works afterwards.
-4. INSTALLER (P-12): from a stock image carrying today's gate + v13 body,
-   over the wire: arm the AIF marker, erase the 96 KB boot sector, stream
-   the stock boot content back WITH the ring spliced in, erase the 8 KB
-   sector at 0x4000 and rewrite it with the one patched handoff word,
-   erase MPC block 0 and restore it stock (taking the v13 gate's MPC 0x8
-   hook out), verify each piece, DONE. The result is byte-identical to
-   tools/bl14.py's build, and the installed image passes the inert diff
-   and the taken path -- stock -> BL14 without a soldering iron.
 
-The installer body is a bench variant (PERM_LOW=0x4000, the 8 KB sector
-opened below the boot sector); the ring it installs carries the shipped
-narrow body (PERM_LOW=0x8000).
+The install over the wire is proven by tools/proofs/bl_app_test.py, the
+app's own sequence.
 """
-import os
 import struct
 import sys
 import time
 
 from tools.build import flasher_body
-from tools.build import bl14
+from tools.build import bl
 from ms45emu.image import load_named, Pair
 from ms45emu.board import Board, RESET_ENTRY
 from ms45emu.checksums import crc32_mpeg2
 from ms45emu.fold import CRC_AT, CRC_FROM, CRC_TO, MON_AT, monitor_sum
-from tools.build.flasher_gate import (build as gate_build, ENTRY_CPU,
-                          stamp_bytes, hook_word)
-from tools.build.flasher_body import (SRAM_BASE, REPLY_OFF, MARK_ARMED,
-                          AIF_READ, AIF_ARM, AIF_DONE, MPC_WINDOW)
+from tools.build.flasher_gate import stamp_bytes
+from tools.build.flasher_body import SRAM_BASE, REPLY_OFF, AIF_READ
 from tools.proofs.flasher_session_test import (Session, frame, lit_nrv2b,
                                   expect, expect_nak, fast_waits)
-from tools.proofs.mpc_session_test import push_chunks
 from tools.proofs.gate_test import Traced
 from tools.experiments.aif_wipe import AIF
-from tools import ROOT
 
 IMAGE = "session1.livetune6-notraps"
 CAL, CAL_END = 0x40000, 0x5D000
@@ -80,12 +66,12 @@ def fresh(f, m, name, waits=False):
 
 def hello_wait(s, note, payload=None):
     """Release the line, take HELLO, byte-exact assert (v13 for the gate
-    layout, the BL14 stamp for the ring)."""
+    layout, the BL stamp for the ring)."""
     s.sci.line_hold = False
     if not s.until(lambda: len(s.sci.tx) >= 21):
         raise SystemExit(f"FAIL: no HELLO after the line released ({note})")
     hello = bytes(s.sci.tx[:21])
-    want = frame(0x40, payload if payload is not None else stamp_bytes(13, 3))
+    want = frame(0x40, payload if payload is not None else stamp_bytes(20, 0x1B))
     if hello != want:
         raise SystemExit(f"FAIL [{note}]: HELLO {hello.hex()} (want {want.hex()})")
     print(f"  ok: HELLO {hello[4:10].decode()} v{hello[10]} flags {hello[11]:#04x} ({note})")
@@ -126,11 +112,11 @@ def boot_to_entry(f, m, name):
 
 
 def inert(pair, bl_f, bl_m):
-    print("=" * 64, "\n1. INERT -- BL14 boots the program exactly as stock\n" + "=" * 64)
+    print("=" * 64, "\n1. INERT -- BL boots the program exactly as stock\n" + "=" * 64)
     stock_b, stock_n, stock_regs, stock_x = boot_to_entry(pair.flash, pair.mpc, "stock")
-    bl_b, bl_n, bl_regs, bl_x = boot_to_entry(bl_f, bl_m, "bl14")
+    bl_b, bl_n, bl_regs, bl_x = boot_to_entry(bl_f, bl_m, "bl")
     cost = bl_n - stock_n
-    print(f"program start: stock at insn {stock_n}, bl14 at insn {bl_n} "
+    print(f"program start: stock at insn {stock_n}, bl at insn {bl_n} "
           f"(window cost {cost} insns = {cost / 40:.0f} us)")
 
     bad = [f"r{i}" for i in range(32)
@@ -141,7 +127,7 @@ def inert(pair, bl_f, bl_m):
     if bad:
         for i in range(0, 32, 8):
             print("  stock " + " ".join(f"r{i+j:02d}={stock_regs[i+j]:#010x}" for j in range(8)))
-            print("  bl14  " + " ".join(f"r{i+j:02d}={bl_regs[i+j]:#010x}" for j in range(8)))
+            print("  bl  " + " ".join(f"r{i+j:02d}={bl_regs[i+j]:#010x}" for j in range(8)))
         raise SystemExit(f"FAIL: state at the program entry differs beyond r3-r8: {bad}")
     diffed = [f"r{i}" for i in range(3, 9) if stock_regs[i] != bl_regs[i]]
     print(f"  ok: entry state identical apart from the window scratches ({', '.join(diffed) or 'none even differ'})"
@@ -149,7 +135,7 @@ def inert(pair, bl_f, bl_m):
 
     # stream identity from the entry (gate_test's shape, interrupt re-sync)
     stock_t = Traced(bl_pair(pair.flash, pair.mpc, "stock-stream"))
-    bl_t = Traced(bl_pair(bl_f, bl_m, "bl14-stream"))
+    bl_t = Traced(bl_pair(bl_f, bl_m, "bl-stream"))
     stock_t.boot_to_entry()
     bl_t.boot_to_entry()
     stock_t.run_stream()
@@ -163,7 +149,7 @@ def inert(pair, bl_f, bl_m):
         pos = next((i for i in range(len(ht) - 64) if tuple(ht[i:i + 64]) == window), None)
         if pos is None:
             raise SystemExit(f"FAIL: PATH DIVERGENCE at +{d} "
-                             f"(stock {stock_t.stream[d]:#x} vs bl14 {bl_t.stream[d]:#x})")
+                             f"(stock {stock_t.stream[d]:#x} vs bl {bl_t.stream[d]:#x})")
         print(f"inert: identical for +{d}, then interrupt shift, re-sync at +{d + pos}"
               " -- path identity holds")
     return stock_regs, stock_n
@@ -191,9 +177,9 @@ def taken(f, m, note, deep=False):
 
 
 def session(pair, bl_f, bl_m):
-    print("=" * 64, "\n2/3. TAKEN + the cal session on the BL14 image\n" + "=" * 64)
-    board, s = taken(bl_f, bl_m, "bl14-taken", deep=True)
-    hello_wait(s, "bl14", bl14.stamp_bytes())
+    print("=" * 64, "\n2/3. TAKEN + the cal session on the BL image\n" + "=" * 64)
+    board, s = taken(bl_f, bl_m, "bl-taken", deep=True)
+    hello_wait(s, "bl", bl.stamp_bytes(flags=bl.ring_flags()))
 
     expect(s.xfer(0x00), 0x00, "HELLO (request form)")
     expect_nak(s.xfer(0x77), 0x77, 6, "unknown service")
@@ -248,7 +234,7 @@ def session(pair, bl_f, bl_m):
     if bytes(board.flash.image[CAL:CAL_END]) != bytes(target[CAL:CAL_END]):
         raise SystemExit("FAIL: chip image differs from the target cal")
 
-    # ---- the BL14 properties ---------------------------------------------
+    # ---- the BL properties ---------------------------------------------
     img = bytes(board.flash.image)
     if img[:0x20000] != bytes(bl_f[:0x20000]):
         first = next(i for i in range(0x20000) if img[i] != bl_f[i])
@@ -272,11 +258,11 @@ def session(pair, bl_f, bl_m):
     fresh_b = board.reset()
     reached, why = fresh_b.boot(max_insns=2_000_000, until=RESET_ENTRY, reset_vector=True)
     if not reached:
-        raise SystemExit(f"FAIL: the new cal does not boot through BL14 ({why})")
-    print("reboot: the loader starts the program on the new cal (BL14 inert path)")
+        raise SystemExit(f"FAIL: the new cal does not boot through BL ({why})")
+    print("reboot: the loader starts the program on the new cal (BL inert path)")
 
-    board2, s2 = taken_from_reset(fresh_b, "bl14-retaken")
-    hello_wait(s2, "bl14 after the session", bl14.stamp_bytes())
+    board2, s2 = taken_from_reset(fresh_b, "bl-retaken")
+    hello_wait(s2, "bl after the session", bl.stamp_bytes(flags=bl.ring_flags()))
     expect(s2.xfer(0x00), 0x00, "HELLO again after the session+reboot")
     return target
 
@@ -292,7 +278,7 @@ def taken_from_reset(board, note):
     s = Session(b)
     if not s.until(lambda: SRAM_BASE <= b.m.pc < SRAM_BASE + REPLY_OFF, budget=200_000):
         raise SystemExit(f"FAIL [{note}]: the body is not in SRAM")
-    print(f"taken [{note}]: BL14 serves again after reset")
+    print(f"taken [{note}]: BL serves again after reset")
     return b, s
 
 
@@ -319,120 +305,19 @@ def chunk_span(s, base, data, note):
     print(f"  ok: {note}: CHUNK x{n}")
 
 
-def installer(pair, bl_f, bl_m, stock_regs, stock_n):
-    print("=" * 64, "\n4. INSTALLER -- stock+gate image -> BL14, over the wire\n" + "=" * 64)
-    flasher_body.PERM_LOW = 0x4000                     # the bench installer body
-    inst_f, inst_m = gate_build(pair.flash, pair.mpc)
-    flasher_body.PERM_LOW = 0x8000
-    board = fresh(inst_f, inst_m, "bl14-install", waits=True)
-
-    # entry through today's gate (MPC 0x8), exactly as the app does it
-    board.sci.line_hold = True
-    reached, why = board.boot(max_insns=2_000_000, until=ENTRY_CPU + 4, reset_vector=True)
-    if not reached:
-        raise SystemExit(f"FAIL: never reached the gate entry ({why})")
-    s = Session(board)
-    if not s.until(lambda: SRAM_BASE <= board.m.pc < SRAM_BASE + REPLY_OFF, budget=2_000_000):
-        raise SystemExit("FAIL: the body never reached SRAM")
-    hello_wait(s, "installer (gate image)")
-
-    if marker(s) != 0xFFFF:
-        raise SystemExit(f"FAIL: marker not fresh ({marker(s):#06x})")
-    expect(s.xfer(S_AIF, bytes([AIF_ARM])), S_AIF, "AIF ARM")
-    if marker(s) != MARK_ARMED:
-        raise SystemExit("FAIL: marker not armed")
-
-    # ---- the 96 KB boot sector: stock content + the ring ------------------
-    expect(s.xfer(0x02, struct.pack(">I", BOOT)), 0x02, "ERASE the boot sector")
-    fr = s.xfer(0x01, struct.pack(">II", BOOT, 0x20000 - BOOT), budget=90_000_000)
-    expect(fr, 0x01, "SECTOR_QUERY of the erased boot sector")
-    if struct.unpack(">I", fr[4:8])[0] != crc32_mpeg2(b"\xff" * (0x20000 - BOOT)):
-        raise SystemExit("FAIL: boot sector not blank after ERASE")
-
-    payload = bytearray(bl_f[BOOT:AIF_START])
-    if len(payload) % 8:
-        payload += b"\xff" * (8 - len(payload) % 8)
-    chunk_span(s, BOOT, bytes(payload), "restore boot content + the BL14 ring")
-    want = crc32_mpeg2(bytes(bl_f[BOOT:AIF_START]))
-    expect(s.xfer(0x04, struct.pack(">III", BOOT, AIF_START - BOOT, want)),
-           0x04, "VERIFY of the restored boot sector")
-
-    # ---- the 8 KB sector: stock content + the one patched word ------------
-    expect(s.xfer(0x02, struct.pack(">I", SECT8K)), 0x02,
-           "ERASE the 8 KB sector at 0x4000 (bench window)")
-    chunk_span(s, SECT8K, bytes(bl_f[SECT8K:SECT8K + 0x2000]),
-               "rewrite it with the patched handoff word at 0x4EBC")
-    want = crc32_mpeg2(bytes(bl_f[SECT8K:SECT8K + 0x2000]))
-    expect(s.xfer(0x04, struct.pack(">III", SECT8K, 0x2000, want)),
-           0x04, "VERIFY of the 8 KB sector")
-    got = struct.unpack(">I", bytes(board.flash.image[bl14.PATCH_AT:bl14.PATCH_AT + 4]))[0]
-    if got != hook_word(0xFFF00000 + bl14.WINDOW_AT):
-        raise SystemExit(f"FAIL: the patch word is {got:#010x}")
-
-    # ---- MPC block 0: stock content (the gate's 0x8 hook comes out) -------
-    expect(s.xfer(0x02, struct.pack(">I", MPC_WINDOW)), 0x02, "ERASE MPC block 0")
-    push_chunks(s, board, MPC_WINDOW, bytes(pair.mpc[:0x8000]), "MPC block 0 restored stock")
-    want = crc32_mpeg2(bytes(pair.mpc[:0x8000]))
-    expect(s.xfer(0x04, struct.pack(">III", MPC_WINDOW, 0x8000, want)),
-           0x04, "VERIFY of MPC block 0")
-
-    expect(s.xfer(S_AIF, bytes([AIF_DONE])), S_AIF, "AIF DONE")
-    if marker(s) != 0xFFFF:
-        raise SystemExit("FAIL: the next marker slot is not fresh after DONE")
-
-    # ---- the result is exactly the built image ---------------------------
-    img = bytes(board.flash.image)
-    if img[:AIF_START] != bytes(bl_f[:AIF_START]):
-        first = next(i for i in range(AIF_START) if img[i] != bl_f[i])
-        raise SystemExit(f"FAIL: installed image differs from the build at ext {first:#x}")
-    if img[AIF_START:0x20000] != b"\xff" * (0x20000 - AIF_START):
-        raise SystemExit("FAIL: the AIF span is not blank (the wipe side effect)")
-    if bytes(board.cmf.image) != bytes(pair.mpc):
-        raise SystemExit("FAIL: the MPC image differs from stock")
-    print("  ok: installed ext [0x0, 0x1FB34) == bl14.build, AIF blank, MPC == stock")
-
-    expect(s.xfer(0x06), 0x06, "RESET")
-    print("installed: BL14 is on the DME by wire alone")
-
-    # ---- the installed image passes the same proofs -----------------------
-    b, n, regs, _x = boot_to_entry(img, board.cmf.image, "installed-inert")
-    if n - stock_n > 120_000:
-        raise SystemExit(f"FAIL: installed window cost {n - stock_n} insns")
-    bad = [f"r{i}" for i in range(32)
-           if stock_regs[i] != regs[i] and not 3 <= i <= 8]
-    if bad:
-        raise SystemExit(f"FAIL: installed inert diff beyond r3-r8: {bad}")
-    print(f"inert [installed]: entry at insn {n} (window {n - stock_n} insns), "
-          "state identical apart from r3-r8")
-
-    ib = board.reset()
-    ib.sci.line_hold = True
-    reached, why = ib.boot(max_insns=2_000_000, until=SRAM_BASE, reset_vector=True)
-    if not reached:
-        raise SystemExit(f"FAIL: the installed window never fired ({why})")
-    ib.run_from(SRAM_BASE, 100_000, until=0x1)
-    s2 = Session(ib)
-    if not s2.until(lambda: SRAM_BASE <= ib.m.pc < SRAM_BASE + REPLY_OFF, budget=200_000):
-        raise SystemExit("FAIL: the installed body is not in SRAM")
-    hello_wait(s2, "installed", bl14.stamp_bytes())
-    expect(s2.xfer(0x00), 0x00, "HELLO (request form) on the installed ring")
-    print("taken [installed]: the ring serves the fast path -- end to end")
-
-
 def main():
     t0 = time.time()
     pair = load_named(IMAGE)
-    bl_f, bl_m = bl14.build(pair.flash, pair.mpc)
+    bl_f, bl_m = bl.build(pair.flash, pair.mpc)
     body_words, _ = flasher_body.build_body()
     print(f"built: ring body {len(body_words)} words, "
-          f"patch word -> window at ext {bl14.WINDOW_AT:#x}")
+          f"patched words -> windows at ext {bl.WINDOW_AT:#x} and {bl.PARKWIN_AT:#x}")
 
     stock_regs, stock_n = inert(pair, bl_f, bl_m)
     session(pair, bl_f, bl_m)
-    installer(pair, bl_f, bl_m, stock_regs, stock_n)
 
     print("=" * 64)
-    print(f"ALL OK -- inert + taken + session + installer, {time.time() - t0:.0f}s wall")
+    print(f"ALL OK -- inert + taken + session, {time.time() - t0:.0f}s wall")
     return 0
 
 

@@ -3,8 +3,8 @@
 Run from the ms45-emu root: .venv/bin/python -m tools.proofs.mpc_session_test
 
 Everything the app's "full fast flash" does to the CMF, over the emulated
-wire: QUERY/ERASE/CHUNK/VERIFY through the 0x80000000 window, mid-page
-chunk staging, the contract order (blocks 13..1 then 0, the ext check
+wire: QUERY/ERASE/CHUNK/VERIFY through the 0x80000000 window, the whole-page
+CHUNK contract, a pageset that will not take (NAK 4), the contract order (blocks 13..1 then 0, the ext check
 block, MARKS 1, RESET), a fresh boot that starts the pushed stock program
 through the loader's own checks, and the resume-without-reset path (HELLO
 answered mid-push). The pushed MPC is the stock donor pair; the ext cal
@@ -16,7 +16,7 @@ import struct
 import sys
 import time
 
-from ms45emu.image import load_named, Pair
+from ms45emu.image import load_named, load_pair, Pair
 from ms45emu.board import Board, RESET_ENTRY
 from ms45emu.checksums import crc32_mpeg2
 from tools.build.flasher_gate import build, ENTRY_CPU, STAMP_AT, stamp_bytes
@@ -54,10 +54,9 @@ WATCHDOG_MS = 100        # the loader's SYPCR 0x07A17F87, write-once
 
 def main():
     t0 = time.time()
-    pair = load_named("session1.livetune6-notraps")
+    pair = load_named(os.environ.get("MPC_BASE", "session1.livetune6-notraps"))   # MPC_BASE=hybC: loader build C
     f, m = build(pair.flash, pair.mpc)
-    stock = Pair(open("/tmp/ms45-stock/flash.bin", "rb").read(),
-                 open("/tmp/ms45-stock/mpc.bin", "rb").read(), "stock")
+    stock = load_pair("stock")         # MS45_FLASH/MS45_MPC, or images/stock_*.bin
     board = Board(Pair(bytes(f), bytes(m), "quickflash1", check_program=False),
                   waits=fast_waits() if "--fast-wait" in sys.argv else None)
     s = Session(board)
@@ -73,7 +72,7 @@ def main():
     if not s.until(lambda: len(board.sci.tx) >= 21):
         raise SystemExit("FAIL: no HELLO after the break released")
     hello = bytes(board.sci.tx[:21])
-    if hello != frame(0x40, stamp_bytes(13, 3)):
+    if hello != frame(0x40, stamp_bytes(20, 0x1B)):
         raise SystemExit(f"FAIL: HELLO mismatch: {hello.hex()}")
     print(f"hello: {hello[4:10].decode()} v{hello[10]} flags {hello[11]:#04x}")
     board.watchdog_window()                      # the body runs from here
@@ -84,35 +83,28 @@ def main():
     board.m.mu.mem_write(WM_LO, b"\xa5" * (WM_HI - WM_LO))
     SCC1R0 = 0x305008
 
-    # ---- SET_BAUD: switch, hold, and the silent fallback ---------------
+    # ---- SET_BAUD: switch and hold (the probation countdown retired with
+    # v14: a switch the tester could not follow is recovered by a reset,
+    # which always boots at 115200) --------------------------------------
     scbr = lambda: board.imb.peek16(SCC1R0) & 0x1FFF           # noqa: E731
-    # a new rate, used but never confirmed: the body gives it up (v8 kept any
-    # rate it could read telegrams at, and a one-way line stranded the car)
     expect(s.xfer(0x07, struct.pack(">H", 5)), 0x07, "SET_BAUD to SCBR 5 (250 kbaud)")
     if scbr() != 5:
         raise SystemExit(f"FAIL: SCBR after SET_BAUD is {scbr()}, want 5")
     expect(s.xfer(0x00), 0x00, "HELLO at 250 kbaud")
     expect(s.xfer(0x01, struct.pack(">II", 0x40000, 0x1000)), 0x01, "QUERY at 250 kbaud")
-    if not s.until(lambda: scbr() == 11, budget=200_000_000):
-        raise SystemExit(f"FAIL: unconfirmed, the body did not fall back to 115200 (SCBR {scbr()})")
-    print("  ok: a rate used but never confirmed: the body fell back to 115200 by itself")
-    expect(s.xfer(0x00), 0x00, "HELLO at 115200 after the fallback")
-    # confirmed, it holds through silence; then back by request, confirmed
-    expect(s.xfer(0x07, struct.pack(">H", 5)), 0x07, "SET_BAUD to SCBR 5 again")
-    expect(s.xfer(0x00), 0x00, "HELLO at 250 kbaud")
-    expect(s.xfer(0x07, struct.pack(">H", 5)), 0x07, "SET_BAUD 5 while on 5: confirmed")
+    # it holds through silence now; no fallback, no confirm dance
     s.until(lambda: False, budget=150_000_000)
     if scbr() != 5:
-        raise SystemExit(f"FAIL: confirmed rate did not hold (SCBR {scbr()})")
-    print("  ok: confirmed, 250 kbaud held through 3.7 s of silence")
+        raise SystemExit(f"FAIL: the rate did not hold (SCBR {scbr()})")
+    print("  ok: 250 kbaud held through 3.7 s of silence")
+    expect(s.xfer(0x00), 0x00, "HELLO still at 250 kbaud")
+    expect(s.xfer(0x07, struct.pack(">H", 5)), 0x07, "SET_BAUD 5 while on 5 (idempotent)")
     expect(s.xfer(0x07, struct.pack(">H", 11)), 0x07, "SET_BAUD back to SCBR 11")
     expect(s.xfer(0x00), 0x00, "HELLO at 115200")
-    expect(s.xfer(0x07, struct.pack(">H", 11)), 0x07, "confirmed at 115200")
-    expect(s.xfer(0x07, struct.pack(">H", 4)), 0x07, "SET_BAUD to SCBR 4, then silence")
-    if not s.until(lambda: scbr() == 11, budget=200_000_000):
-        raise SystemExit(f"FAIL: silent after SET_BAUD, no fallback (SCBR {scbr()})")
-    print("  ok: silent after SET_BAUD: the body fell back to 115200 by itself")
-    expect(s.xfer(0x00), 0x00, "HELLO at 115200 after the fallback")
+    expect(s.xfer(0x07, struct.pack(">H", 4)), 0x07, "SET_BAUD to SCBR 4 (416667)")
+    expect(s.xfer(0x00), 0x00, "HELLO at 416667")
+    expect(s.xfer(0x07, struct.pack(">H", 11)), 0x07, "SET_BAUD back to 115200")
+    expect(s.xfer(0x00), 0x00, "HELLO at 115200")
     expect_nak(s.xfer(0x07, struct.pack(">H", 0)), 0x07, 6, "SET_BAUD 0 refused")
 
     # ---- the window's permission edges ----------------------------------
@@ -138,13 +130,20 @@ def main():
     if cpu_view(board, 13 * BLOCK, BLOCK) != b"\xff" * BLOCK:
         raise SystemExit("FAIL: block 13 not blank in the CPU view after ERASE")
 
-    # two spans inside the erased block: one mid-page (staging below and
-    # above the span), one crossing a page boundary (cursor continuation).
-    # Lengths are multiples of 8 -- the test's all-literal NRV2B form needs
-    # whole groups; the real JS encoder has no such limit (byte-exact on all
-    # 301 real chunks, tools/nrv2b_emu_test.py)
+    # v19: an MPC CHUNK is whole, page-aligned pages (the wrapper's partial-
+    # page staging went with the per-build driver window; the app only ever
+    # sends 4 KB chunks or pagesets). A mid-page span is refused, nothing
+    # written; two aligned spans inside the erased block go in, one page and
+    # two pages (the cursor continuing across the page border).
     for off, ln, note in ((0x18, 0x10, "CHUNK mid-page (span at +0x18)"),
-                         (0x30, 0x60, "CHUNK across the page border (+0x30)")):
+                         (0x40, 0x10, "CHUNK of a partial page")):
+        span = bytes((i * 7 + 1) & 0xFF for i in range(ln))
+        comp = lit_nrv2b(span)
+        hdr = struct.pack(">IHHI", MPC_WINDOW | 13 * BLOCK + off, len(span),
+                          len(comp), crc32_mpeg2(comp))
+        expect_nak(s.xfer(0x03, hdr + comp), 0x03, 4, note + " refused")   # the CHUNK handler's one MPC reason
+    for off, ln, note in ((0x40, 0x40, "CHUNK of one page (+0x40)"),
+                         (0x80, 0x80, "CHUNK across the page border (+0x80, two pages)")):
         span = bytes((i * 7 + 1) & 0xFF for i in range(ln))
         comp = lit_nrv2b(span)
         hdr = struct.pack(">IHHI", MPC_WINDOW | 13 * BLOCK + off, len(span),
@@ -155,10 +154,23 @@ def main():
             raise SystemExit(f"FAIL: {note}: wrong in the CMF image")
         if cpu_view(board, base13 + off, ln) != span:
             raise SystemExit(f"FAIL: {note}: wrong in the CPU view")
-    if cpu_view(board, 13 * BLOCK + 0x08, 0x10) != b"\xff" * 0x10 or \
-       cpu_view(board, 13 * BLOCK + 0x28, 0x08) != b"\xff" * 0x08 or \
-       cpu_view(board, 13 * BLOCK + 0x90, 0x3F0) != b"\xff" * 0x3F0:
-        raise SystemExit("FAIL: staging disturbed bytes outside the spans")
+    if cpu_view(board, 13 * BLOCK, 0x40) != b"\xff" * 0x40 or \
+       cpu_view(board, 13 * BLOCK + 0x100, 0x380) != b"\xff" * 0x380:
+        raise SystemExit("FAIL: the pages around the spans were disturbed")
+
+    # ---- a pageset that will not take: NAK 4, and the body still answers.
+    # Until v20 this NAK's label was also cmf_chunkset's readback loop's;
+    # the loop's won, and the failure ran the body off to PC 0 with no reply.
+    # The pages ask 0 -> 1 of unerased blocks (12 holds the stock program,
+    # 13 the spans above); the full push below erases both.
+    for mask, note in ((1 << 13, "one block"), ((1 << 12) | (1 << 13), "two blocks")):
+        cur = b"".join(cpu_view(board, b * BLOCK + 0x40, 64)
+                       for b in range(14) if mask >> b & 1)
+        plain = bytes(x ^ 0xFF for x in cur)
+        comp = lit_nrv2b(plain)
+        hdr = struct.pack(">HHHHIB3x", mask, 0x40, len(plain), len(comp), crc32_mpeg2(comp), 1)
+        expect_nak(s.xfer(0x08, hdr + comp), 0x08, 4, f"CHUNK_SET over unerased pages ({note})")
+        expect(s.xfer(0x00), 0x00, f"HELLO after the refused pageset ({note})")
 
     # ---- the full push: blocks 13..1 as pagesets, block 0 last ---------
     block0_before = bytes(board.cmf.image[:BLOCK])
@@ -221,6 +233,17 @@ def main():
            "VERIFY of the whole window")
     expect_nak(s.xfer(0x04, struct.pack(">III", MPC_WINDOW, 0x70000, want ^ 1)), 0x04, 5,
                "VERIFY with a wrong CRC mismatches")
+
+    # MARKS reads every halfword back (v20): a cal mark that cannot take --
+    # its halfword zeroed, programming only clears bits -- is NAK 4, the
+    # body answers on; valid marks burned over again are fine
+    CAL_MARK = 0x5FF80
+    cal_marks = bytes(board.flash.image[CAL_MARK:CAL_MARK + 0x44])
+    expect(s.xfer(0x05, b"\x00"), 0x05, "MARKS (cal) over marks already valid")
+    board.flash.store(CAL_MARK, b"\x00\x00")
+    expect_nak(s.xfer(0x05, b"\x00"), 0x05, 4, "MARKS (cal) over a halfword that cannot take")
+    expect(s.xfer(0x00), 0x00, "HELLO after the refused MARKS")
+    board.flash.store(CAL_MARK, cal_marks)
 
     expect(s.xfer(0x05, b"\x01"), 0x05, "MARKS (program)")
     for at, hi, lo in ((0xFFF80, 0x4290, 0x2448), (0xFFFC0, 0x4224, 0x4890)):

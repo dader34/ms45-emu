@@ -425,6 +425,10 @@ class WebSocket:
             return
         if "op" not in msg:                            # webserial-emu.js: the port's settings or its lines
             self.baud = msg.get("baudRate", self.baud)
+            # its setSignals sends {signals} with no op and wants no reply: the
+            # break was dropped here, so a late hold from a page on the shim
+            # never reached the DME (the gateway's op-form below always had it)
+            self._set_break((msg.get("signals") or {}).get("break"))
             return
         reply = {"id": msg.get("id"), "ok": True}
         op = msg["op"]
@@ -436,17 +440,20 @@ class WebSocket:
             # the cable reports the ignition (KL15) on DSR/DCD
             reply["signals"] = {"dataSetReady": self.ignition, "dataCarrierDetect": self.ignition, "clearToSend": False}
         elif op == "setSignals":
-            want = (msg.get("signals") or {}).get("break")
-            if want is not None:
-                self.break_wanted = bool(want)
-                # the break's timing against the reset is what decides the
-                # quick-flash gate, so a miss has to be visible in the log
-                print(f"{time.strftime('%H:%M:%S')}."
-                      f"{int(time.time() * 1000) % 1000:03d} tester: break "
-                      f"{'held' if self.break_wanted else 'released'}", flush=True)
+            self._set_break((msg.get("signals") or {}).get("break"))
         else:
             reply = {"id": msg.get("id"), "ok": False, "error": f"unknown call {op}"}
         self._send(0x1, json.dumps(reply).encode())
+
+    def _set_break(self, want):
+        if want is None:
+            return
+        self.break_wanted = bool(want)
+        # the break's timing against the reset is what decides the
+        # quick-flash gate, so a miss has to be visible in the log
+        print(f"{time.strftime('%H:%M:%S')}."
+              f"{int(time.time() * 1000) % 1000:03d} tester: break "
+              f"{'held' if self.break_wanted else 'released'}", flush=True)
 
     def write(self, data):
         if self.client is not None:
@@ -753,11 +760,17 @@ def wrong_rate(line, baud):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pair", default="patched", choices=["stock", "patched", "livetune"])
+    ap.add_argument("--image", default=None, metavar="NAME",
+                    help="images/NAME.flash.bin + .mpc.bin as read off a DME, any program the loader starts "
+                         "(an MS45.0's, say); overrides --pair")
     ap.add_argument("--program", default=None, metavar="FILE.0PA",
                     help="one of BMW's program files, written onto the pair first (its boot loader is kept)")
     ap.add_argument("--calibration", default=None, metavar="FILE.0DA",
                     help="one of BMW's calibration files, likewise; without it a program gets one that is made for it")
     ap.add_argument("--eeprom", default="images/eeprom.bin")
+    ap.add_argument("--park-pc", action="append", default=[], metavar="HEX",
+                    help="also watch this SRAM address as a flasher RESET park: a body of another build on the "
+                         "image (an older BL ring, say) parks elsewhere than the one this checkout builds")
     ap.add_argument("--port", default=None, help="a real serial device instead of a pseudo-terminal")
     ap.add_argument("--socket", default=None, help="also serve the line on this Unix socket (a VM's serial port)")
     ap.add_argument("--ws", type=int, default=None, metavar="PORT",
@@ -822,6 +835,12 @@ def main():
         # observed at 0x6F8E0, not the 0xFFF-mapped runtime address).
         fold_reset_pcs = (fold.DONE, fold.FAILED)
         print(f"booting {pair.name} (live-tune build)", flush=True)
+    elif args.image:
+        from ms45emu.image import IMAGES_DIR
+        with open(os.path.join(IMAGES_DIR, f"{args.image}.flash.bin"), "rb") as f, \
+             open(os.path.join(IMAGES_DIR, f"{args.image}.mpc.bin"), "rb") as m:
+            pair = Pair(f.read(), m.read(), args.image, check_program=False)
+        print(f"booting {pair.name}: program {pair.program_id.decode('latin1')}", flush=True)
     elif args.program or args.calibration:
         from ms45emu import daten                # a .0PA / .0DA on the pair's boot loader (ms45emu/daten.py)
         pair = daten.load(args.pair, args.program, args.calibration, say=lambda text: print(text, flush=True))
@@ -867,6 +886,7 @@ def main():
     park_pc = None
     body_lo = body_hi = None                        # the body's SRAM range, when an image carries one
     park_mark_at = None                             # ext offset where an image carries its own park PC
+    extra_parks = {int(p, 16) for p in args.park_pc}  # --park-pc: bodies of other builds on the image
     try:
         from tools.build import flasher_body
         flasher_body.build_parts()                  # fills PARK_PC (the body the install was built from)
@@ -877,7 +897,9 @@ def main():
             park_mark_at = PARK_MARK_AT
         except ImportError:
             pass                                    # older gate: images carry no park word
-        print(f"flasher RESET park at {park_pc:#x} (watchdog stand-in)", flush=True)
+        print(f"flasher RESET park at {park_pc:#x} (watchdog stand-in)"
+              + (f", also at {', '.join(f'{p:#x}' for p in sorted(extra_parks))} (--park-pc)" if extra_parks else ""),
+              flush=True)
         if not args.no_fast_wait:
             # The body's spins, skipped rather than executed (Board.set_waits):
             # the byte wait and the reply gap (the CMF waits are the loader's
@@ -933,7 +955,7 @@ def main():
         app flashed since may be a different build, sized differently, parking
         elsewhere (the park moves with the body; watching the launch-time PC
         alone went stale the moment an upgrade landed mid-process)."""
-        pcs = {park_pc}
+        pcs = {park_pc} | extra_parks
         if park_mark_at is not None:
             w, = struct.unpack_from(">I", board.flash.image, park_mark_at)
             if body_lo is not None and body_lo <= w < body_hi:

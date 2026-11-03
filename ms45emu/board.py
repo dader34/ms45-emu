@@ -657,7 +657,8 @@ class Board:
         return bytes(self.qspi.eeprom.data)
 
     def load_eeprom(self, image):
-        self.qspi.eeprom.data[:len(image)] = image
+        image = bytes(image[:len(self.qspi.eeprom.data)])    # a 64 KB dump of the
+        self.qspi.eeprom.data[:len(image)] = image           # 4 KB part: its first copy
 
     def run(self, max_insns):
         """Keep running from where the program is."""
@@ -694,9 +695,17 @@ class Board:
         for at, word in self.cpu.patched.items():
             at &= 0xFFFFFFFF
             if at < len(mpc):
-                struct.pack_into(">I", mpc, at, word)
+                image, off = mpc, at
             elif 0xFFF00000 <= at < 0xFFF00000 + len(flash):
-                struct.pack_into(">I", flash, at - 0xFFF00000, word)
+                image, off = flash, at - 0xFFF00000
+            else:
+                continue
+            # a sector the DME itself rewrote since (a boot overwrite, a
+            # program flash) holds its new bytes, not the stub: those stand
+            stub = self.cpu.stubbed.get(at)
+            if stub is not None and struct.unpack_from(">I", image, off)[0] != stub:
+                continue
+            struct.pack_into(">I", image, off, word)
         return Pair(bytes(flash), bytes(mpc), self.m.pair.name, check_program=False)
 
     def program_valid(self):

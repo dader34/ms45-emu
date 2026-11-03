@@ -2,7 +2,7 @@
 
 Run any of them from the repo root as a module, e.g.
 
-    .venv/bin/python -m tools.proofs.bl14_test
+    .venv/bin/python -m tools.proofs.bl_test
     .venv/bin/python -m tools.bench.kline --ws 6802
 
 `make proofs`, `make export` and `make test` run the sets (see Makefile).

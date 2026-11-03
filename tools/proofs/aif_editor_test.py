@@ -1,4 +1,4 @@
-"""The AIF editor protocol, proven on the BL14 image (docs/bootloader.md).
+"""The AIF editor protocol, proven on the BL image (docs/bootloader.md).
 
 Run from the ms45-emu root: .venv/bin/python -m tools.proofs.aif_editor_test
 
@@ -35,13 +35,13 @@ import struct
 import sys
 import time
 
-from tools.build import bl14
+from tools.build import bl
 from ms45emu.image import load_named
 from ms45emu.checksums import crc32_mpeg2
 from tools.build.flasher_body import MARK_AT, MARK_DONE, AIF_ARM, AIF_DONE
 from tools.proofs.flasher_session_test import (Session, frame, lit_nrv2b,
                                   expect, expect_nak, fast_waits)
-from tools.proofs.bl14_test import (hello_wait, taken, marker,
+from tools.proofs.bl_test import (hello_wait, taken, marker,
                        taken_from_reset, BOOT, CHUNK, S_AIF)
 from tools import ROOT
 
@@ -173,10 +173,10 @@ def full_rewrite(s, board, sector, note):
 def main():
     t0 = time.time()
     pair = load_named("session1.livetune6-notraps")
-    bl_f, bl_m = bl14.build(pair.flash, pair.mpc)
+    bl_f, bl_m = bl.build(pair.flash, pair.mpc)
 
     board, s = taken(bl_f, bl_m, "aif-editor", deep=True)
-    hello_wait(s, "editor session", bl14.stamp_bytes())
+    hello_wait(s, "editor session", bl.stamp_bytes(flags=bl.ring_flags()))
     chip0 = bytes(board.flash.image)
     client_file = bytearray(bl_f)      # what the client holds, edits applied
 
@@ -282,7 +282,7 @@ def main():
         raise SystemExit(f"FAIL: no boot through the rewritten sector ({why})")
     print("reboot: the loader starts the program on the rewritten sector")
     b2, s2 = taken_from_reset(fresh_b, "rewrite-retaken")
-    hello_wait(s2, "after the rewrite", bl14.stamp_bytes())
+    hello_wait(s2, "after the rewrite", bl.stamp_bytes(flags=bl.ring_flags()))
     board, s = b2, s2
 
     # ---- 4. CLEAR ALL, the wire-READ fallback ------------------------------

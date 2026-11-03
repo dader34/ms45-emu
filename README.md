@@ -130,7 +130,7 @@ pedals as the trigger, the shifter pair what it saves with the gear lever.
 - `ms45emu/diagpatch.py`  the diagnostic patch: faster K-line logging, CAN log frame, capture buffer
 - `ms45emu/e46.py`      the other modules on the E46's bus
 - `tools/`              the scripts, by kind, each run from the root as a module (`.venv/bin/python -m tools.<kind>.<name>`):
-  - `build/`        the patches and images: the bootloader rings (`bl14`, `bl15`), the flasher body and gate, live tune, the protections, the diagnostic patch
+  - `build/`        the patches and images: the bootloader rings (`bl`, `bl`), the flasher body and gate, live tune, the protections, the diagnostic patch
   - `export/`       what BMWeb carries as generated files: the flasher, bootloader and live tune blobs, the Comfort "Always live" group, the cursor and value maps
   - `proofs/`       the emulator suites that gate what goes on the car (`make proofs` runs them all)
   - `bench/`        the DME on a K line, a WebSocket or a CAN adapter: `kline` (with `webserial-emu.js`, the browser side) and `bench`
